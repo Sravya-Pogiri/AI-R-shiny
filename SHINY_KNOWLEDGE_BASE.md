@@ -300,6 +300,9 @@ actionButton("id", "Run", icon = icon("play"), class = "btn-primary")
 downloadButton("id", "Download Report")
 ```
 
+> [!IMPORTANT]
+> **Input Help Text:** Shiny input components (like `numericInput()`, `selectInput()`, etc.) **do not** accept a `help` parameter. To include help or descriptive text, you must use a separate `helpText("message")` element immediately below the input component.
+
 ### 3.4 Dynamic UI
 
 ```r
@@ -1530,6 +1533,23 @@ mod_server <- function(id) {
 | **rhino** | Enterprise-grade app framework |
 | **shinytest2** | End-to-end testing |
 | **profvis** | Performance profiling |
+
+### 15.5 nphRshiny (Non-Proportional Hazards Analysis)
+
+The `nphRshiny` package is used for weighted log-rank tests and average hazard ratio (AHR) design/analysis under non-proportional hazards (NPH).
+
+**Key Functions & Conventions:**
+- `wlr(time, event, group, rho, gamma, tau)`: Performs a weighted log-rank test on data vectors.
+  - `time`: numeric vector of survival times.
+  - `event`: binary event vector (1 = event, 0 = censored).
+  - `group`: binary treatment group vector (0 = control, 1 = experimental).
+  - `rho`, `gamma`: Fleming-Harrington parameters.
+  - `tau`: truncation/stabilization time.
+  - Returns a list with `$test.results` (containing columns `z`, `chisq`, `p`, `test.side`).
+- `plot_AHR(n, Tmax, r, h0, S0, h1, S1, rho, gamma, tau, ...)`: Design-based function that calculates expected average hazard ratio over time.
+  - **Important:** Does NOT take a patient-level dataset. It accepts parameters like sample size `n`, time window `Tmax`, randomization ratio `r`, control hazard `h0(t)`, control survival `S0(t)`, experimental hazard `h1(t)`, experimental survival `S1(t)`.
+  - Returns a numeric vector of AHRs of length `Tmax` which can be plotted. To plot from data, estimate `lambda` for both arms and feed the parametric functions to `plot_AHR`, then extract the returned vector to plot using `ggplot2`/`plotly`.
+- `plot_S(S, Tmax, ...)`: Plots design-based survival curves for a list of survival functions `S = list(S0, S1)`. Does not accept patient-level data.
 
 ---
 
