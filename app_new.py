@@ -163,7 +163,46 @@ def _clean_doc_text(s):
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
-# Given the text of a single .Rd file, return {alias_name: short_description}
+def _clean_arguments_block(args_text):
+    if not args_text:
+        return ""
+    items = []
+    idx = 0
+    while True:
+        marker = "\\item{"
+        pos = args_text.find(marker, idx)
+        if pos == -1:
+            break
+        name_start = pos + len(marker)
+        depth = 1
+        i = name_start
+        while i < len(args_text) and depth > 0:
+            if args_text[i] == "{":
+                depth += 1
+            elif args_text[i] == "}":
+                depth -= 1
+            i += 1
+        name = args_text[name_start:i - 1].strip()
+        
+        desc_start = args_text.find("{", i)
+        if desc_start == -1:
+            idx = i
+            continue
+        depth = 1
+        j = desc_start + 1
+        while j < len(args_text) and depth > 0:
+            if args_text[j] == "{":
+                depth += 1
+            elif args_text[j] == "}":
+                depth -= 1
+            j += 1
+        desc = args_text[desc_start + 1:j - 1].strip()
+        desc = _clean_doc_text(desc)
+        items.append(f"- {name}: {desc}")
+        idx = j
+    return "\n".join(items)
+
+# Given the text of a single .Rd file, return {alias_name: metadata_dict}
 def parse_rd_file(rd_text):
     docs = {}
     names = set()
@@ -171,17 +210,26 @@ def parse_rd_file(rd_text):
         names.add(m.strip())
     for m in re.findall(r"\\alias\{([^}]*)\}", rd_text):
         names.add(m.strip())
-    # Prefer the concise \title; fall back to first sentence of \description
+        
     desc = _clean_doc_text(_extract_braced_block(rd_text, "title"))
     if not desc:
         long_desc = _clean_doc_text(_extract_braced_block(rd_text, "description"))
         desc = long_desc[:160].strip()
+        
+    usage = _clean_doc_text(_extract_braced_block(rd_text, "usage"))
+    arguments_raw = _extract_braced_block(rd_text, "arguments")
+    arguments = _clean_arguments_block(arguments_raw)
+    
     for n in names:
         if n:
-            docs[n] = desc
+            docs[n] = {
+                "description": desc,
+                "usage": usage,
+                "parameters": arguments
+            }
     return docs
 
-# Parse roxygen (#') comment blocks from raw R source -> {func_name: description}
+# Parse roxygen (#') comment blocks from raw R source -> {func_name: metadata_dict}
 def parse_roxygen_docs(file_content):
     docs = {}
     lines = file_content.splitlines()
@@ -194,12 +242,28 @@ def parse_roxygen_docs(file_content):
         # A function definition immediately following a roxygen block
         m = re.match(r"([a-zA-Z0-9_\.]+)\s*(?:<-|=)\s*function\b", stripped)
         if m and buffer:
+            func_name = m.group(1).strip()
             title = ""
+            params = []
+            usage = ""
             for b in buffer:
                 if b and not b.startswith("@"):
-                    title = b
-                    break
-            docs[m.group(1).strip()] = _clean_doc_text(title)
+                    if not title:
+                        title = b
+                elif b.startswith("@param"):
+                    parts = b[6:].strip().split(" ", 1)
+                    if len(parts) == 2:
+                        params.append(f"- {parts[0].strip()}: {parts[1].strip()}")
+                    else:
+                        params.append(f"- {parts[0].strip()}")
+                elif b.startswith("@usage"):
+                    usage = b[6:].strip()
+            
+            docs[func_name] = {
+                "description": _clean_doc_text(title),
+                "parameters": "\n".join(params),
+                "usage": usage
+            }
         if not stripped.startswith("#'"):
             buffer = []
     return docs
@@ -212,6 +276,7 @@ def build_function_details(functions, docs):
         base = re.split(r"\(", fn, 1)[0].strip()  # handles "name(args)" from scripts
         details.append({"name": fn, "description": docs.get(base, docs.get(fn, ""))})
     return details
+
 
 
 # Parse a uploaded .zip R package
@@ -253,8 +318,10 @@ def parse_zip_package(file_bytes):
                         docs.update(parse_rd_file(rd_text))
                     except Exception:
                         pass
-            metadata["function_docs"] = docs
-            metadata["function_details"] = build_function_details(metadata["functions"], docs)
+            metadata["function_docs"] = {k: v["description"] for k, v in docs.items()}
+            metadata["function_params"] = {k: v["parameters"] for k, v in docs.items()}
+            metadata["function_usage"] = {k: v["usage"] for k, v in docs.items()}
+            metadata["function_details"] = build_function_details(metadata["functions"], metadata["function_docs"])
     except Exception as e:
         metadata["error"] = f"ZIP parsing error: {str(e)}"
     return metadata
@@ -304,27 +371,83 @@ def parse_tar_package(file_bytes):
                             docs.update(parse_rd_file(rd_text))
                     except Exception:
                         pass
-            metadata["function_docs"] = docs
-            metadata["function_details"] = build_function_details(metadata["functions"], docs)
+            metadata["function_docs"] = {k: v["description"] for k, v in docs.items()}
+            metadata["function_params"] = {k: v["parameters"] for k, v in docs.items()}
+            metadata["function_usage"] = {k: v["usage"] for k, v in docs.items()}
+            metadata["function_details"] = build_function_details(metadata["functions"], metadata["function_docs"])
     except Exception as e:
         metadata["error"] = f"tar.gz parsing error: {str(e)}"
     return metadata
 
 # Parse an R script for function declarations
 def parse_r_script(file_content, filename):
-    metadata = {"name": filename, "type": "script", "functions": []}
+    metadata = {
+        "name": filename, 
+        "type": "script", 
+        "functions": [],
+        "function_codes": {},
+        "function_params": {},
+        "function_usage": {}
+    }
     pattern = r"([a-zA-Z0-9_\.]+)\s*(?:<-|=)\s*function\s*\((.*?)\)"
-    matches = re.findall(pattern, file_content)
+    matches = list(re.finditer(pattern, file_content))
     for match in matches:
-        func_name = match[0].strip()
-        args = match[1].strip()
-        metadata["functions"].append(f"{func_name}({args})")
+        func_name = match.group(1).strip()
+        args = match.group(2).strip()
+        full_sig = f"{func_name}({args})"
+        metadata["functions"].append(full_sig)
+        metadata["function_params"][full_sig] = args
+        metadata["function_usage"][full_sig] = f"{func_name}({args})"
+        
+        # Extract balanced brace block for function code
+        start_idx = match.end()
+        brace_start = file_content.find("{", start_idx)
+        if brace_start != -1:
+            depth = 1
+            i = brace_start + 1
+            while i < len(file_content) and depth > 0:
+                if file_content[i] == "{":
+                    depth += 1
+                elif file_content[i] == "}":
+                    depth -= 1
+                i += 1
+            func_code = file_content[match.start():i]
+        else:
+            line_end = file_content.find("\n", start_idx)
+            if line_end != -1:
+                func_code = file_content[match.start():line_end]
+            else:
+                func_code = file_content[match.start():]
+                
+        metadata["function_codes"][full_sig] = func_code
+
     metadata["functions"] = sorted(list(set(metadata["functions"])))
-    # NEW: pull roxygen (#') titles as per-function descriptions
     docs = parse_roxygen_docs(file_content)
-    metadata["function_docs"] = docs
-    metadata["function_details"] = build_function_details(metadata["functions"], docs)
+    metadata["function_docs"] = {k: v["description"] for k, v in docs.items()}
+    metadata["function_params_parsed"] = {k: v["parameters"] for k, v in docs.items()}
+    metadata["function_usage_parsed"] = {k: v["usage"] for k, v in docs.items()}
+    
+    # Fill in fallback details from signature parsing
+    for fn in metadata["functions"]:
+        base = fn.split("(")[0].strip()
+        if base in docs:
+            # If usage is not set by roxygen @usage, default to signature fn
+            if not metadata["function_usage_parsed"].get(base):
+                metadata["function_usage"][fn] = fn
+            else:
+                metadata["function_usage"][fn] = metadata["function_usage_parsed"][base]
+            
+            # If parameters are not set by roxygen @param, default to args list
+            if not metadata["function_params_parsed"].get(base):
+                metadata["function_params"][fn] = metadata["function_params"].get(fn, "")
+            else:
+                metadata["function_params"][fn] = metadata["function_params_parsed"][base]
+        else:
+            metadata["function_usage"][fn] = fn
+            
+    metadata["function_details"] = build_function_details(metadata["functions"], metadata["function_docs"])
     return metadata
+
 
 # Extract owner and repo from GitHub URL
 def parse_github_url(url):
@@ -433,8 +556,10 @@ def fetch_github_package(owner, repo, branch=None, github_token=None):
                         docs.update(parse_rd_file(rd_res.text))
         except Exception:
             pass
-        metadata["function_docs"] = docs
-        metadata["function_details"] = build_function_details(metadata.get("functions", []), docs)
+        metadata["function_docs"] = {k: v["description"] for k, v in docs.items()}
+        metadata["function_params"] = {k: v["parameters"] for k, v in docs.items()}
+        metadata["function_usage"] = {k: v["usage"] for k, v in docs.items()}
+        metadata["function_details"] = build_function_details(metadata.get("functions", []), metadata["function_docs"])
 
     except Exception as e:
         metadata["error"] = f"GitHub fetch error: {str(e)}"
@@ -534,6 +659,16 @@ def call_llm(provider, model_name, system_instruction, prompt, api_key, ollama_h
         
     return "Error: Unknown provider"
 
+# Initialize session state variables
+if "step" not in st.session_state:
+    st.session_state.step = 1
+if "custom_packages_info" not in st.session_state:
+    st.session_state.custom_packages_info = []
+if "added_functions" not in st.session_state:
+    st.session_state.added_functions = []
+if "pages_config" not in st.session_state:
+    st.session_state.pages_config = {}
+
 # --- MAIN APP LAYOUT ---
 
 st.markdown('<div class="main-header">R Shiny Code Generator</div>', unsafe_allow_html=True)
@@ -598,317 +733,620 @@ with st.sidebar:
     It injects best-practice templates, routing schemas, modular programming rules, bslib layout details, and package execution parameters straight into the model context.
     """)
 
-# Main Page Inputs
-col_input, col_output = st.columns([1, 1])
+# Dynamic Step Progress Indicator
+step = st.session_state.step
+col_s1, col_s2, col_s3 = st.columns(3)
+with col_s1:
+    if step == 1:
+        st.markdown("<div style='text-align: center; font-weight: bold; border-bottom: 4px solid #0054AD; color: #0054AD; padding-bottom: 5px;'>1. Upload & Functions</div>", unsafe_allow_html=True)
+    else:
+        st.markdown("<div style='text-align: center; color: #adb5bd; border-bottom: 2px solid #dee2e6; padding-bottom: 5px;'>1. Upload & Functions</div>", unsafe_allow_html=True)
+with col_s2:
+    if step == 2:
+        st.markdown("<div style='text-align: center; font-weight: bold; border-bottom: 4px solid #0054AD; color: #0054AD; padding-bottom: 5px;'>2. Pages & Function Mapping</div>", unsafe_allow_html=True)
+    else:
+        st.markdown("<div style='text-align: center; color: #adb5bd; border-bottom: 2px solid #dee2e6; padding-bottom: 5px;'>2. Pages & Function Mapping</div>", unsafe_allow_html=True)
+with col_s3:
+    if step == 3:
+        st.markdown("<div style='text-align: center; font-weight: bold; border-bottom: 4px solid #0054AD; color: #0054AD; padding-bottom: 5px;'>3. LLM Code Generation</div>", unsafe_allow_html=True)
+    else:
+        st.markdown("<div style='text-align: center; color: #adb5bd; border-bottom: 2px solid #dee2e6; padding-bottom: 5px;'>3. LLM Code Generation</div>", unsafe_allow_html=True)
+st.write("")
 
-with col_input:
-    st.markdown("### 📝 Define Application")
+# ---------------------------------------------------------------------------
+# STEP 1: SOURCE UPLOAD & FUNCTION VERIFICATION
+# ---------------------------------------------------------------------------
+if step == 1:
+    col_input, col_funcs = st.columns([1, 1])
     
-    # User prompt
-    user_prompt = st.text_area(
-        "Describe the Shiny app you want to generate:",
-        height=220,
-        placeholder="e.g. Create a single-file bslib dashboard with a sidebar containing filters for a dataset (Species). The main panel should display a scatter plot using Plotly (Sepal.Length vs Sepal.Width) and an interactive DataTable underneath it showing the filtered dataset.",
-        key="app_prompt"
-    )
+    with col_input:
+        st.markdown("### 📥 1. Specify Sources")
+        st.caption("Upload source code files or connect a GitHub repository containing R packages/scripts.")
+        
+        github_urls_str = st.text_area(
+            "GitHub repository URLs (one per line or comma-separated):",
+            value=st.session_state.get("github_urls_input_val", ""),
+            placeholder="e.g. https://github.com/r-lib/clipr\nhttps://github.com/r-lib/gargle",
+            height=100,
+            key="github_urls_input_val"
+        )
+        
+        uploaded_files = st.file_uploader(
+            "Upload personal R packages (.zip, .tar.gz) or custom scripts (.R):",
+            type=["zip", "tar.gz", "R", "r"],
+            accept_multiple_files=True,
+            key="uploaded_files_input_val"
+        )
+        
+        col_btn1, col_btn2 = st.columns(2)
+        with col_btn1:
+            analyze_btn = st.button("🔍 Analyze Sources", type="primary", use_container_width=True)
+        with col_btn2:
+            clear_btn = st.button("🗑️ Clear Loaded Sources", use_container_width=True)
+            
+        if analyze_btn:
+            st.cache_data.clear() # Clear streamlit cached data to parse documentation files fresh
+            new_packages_info = []
+            
+            # Process uploaded files
+            if uploaded_files:
+                for uploaded_file in uploaded_files:
+                    file_name = uploaded_file.name
+                    file_bytes = uploaded_file.read()
+                    
+                    if file_name.endswith(".zip"):
+                        info = parse_zip_package(file_bytes)
+                        info["filename"] = file_name
+                        new_packages_info.append(info)
+                    elif file_name.endswith(".tar.gz") or file_name.endswith(".tgz"):
+                        info = parse_tar_package(file_bytes)
+                        info["filename"] = file_name
+                        new_packages_info.append(info)
+                    elif file_name.endswith(".R") or file_name.endswith(".r"):
+                        file_content = file_bytes.decode("utf-8", errors="ignore")
+                        info = parse_r_script(file_content, file_name)
+                        new_packages_info.append(info)
+                        
+            # Process GitHub URLs
+            if github_urls_str:
+                urls = re.split(r"[,\n]+", github_urls_str)
+                github_urls = [u.strip() for u in urls if u.strip()]
+                
+                for url in github_urls:
+                    owner, repo, branch = parse_github_url(url)
+                    if owner and repo:
+                        with st.spinner(f"Fetching {owner}/{repo} details from GitHub..."):
+                            info = get_cached_github_package(owner, repo, branch, github_token)
+                            info["url"] = url
+                            new_packages_info.append(info)
+                    else:
+                        new_packages_info.append({
+                            "name": url,
+                            "type": "github_package",
+                            "url": url,
+                            "error": f"Invalid GitHub URL format: '{url}'"
+                        })
+            
+            st.session_state.custom_packages_info = new_packages_info
+            if new_packages_info:
+                st.success(f"Loaded {len(new_packages_info)} sources successfully!")
+            else:
+                st.info("No package/script sources found or uploaded.")
+                
+        if clear_btn:
+            st.cache_data.clear() # Clear streamlit cached data
+            st.session_state.custom_packages_info = []
+            st.session_state.added_functions = []
+            st.success("Cleared all loaded source details, manually added functions, and cleared cache!")
+            st.rerun()
+
+    with col_funcs:
+        st.markdown("### ➕ Add Missing/Lost Functions")
+        st.caption("Manually enter missing functions and associate code, descriptions, and package mappings:")
+        
+        mapped_package = st.text_input("R Package Mapped To (optional):", placeholder="e.g. survival", key="manual_mapped_package")
+        new_fn_name = st.text_input("Function Name & Signature:", placeholder="e.g. estimate_cox(data, threshold)", key="manual_fn_name")
+        new_fn_desc = st.text_input("Mini Description:", placeholder="e.g. Fit a Cox proportional hazards model.", key="manual_fn_desc")
+        new_fn_params = st.text_area("Parameters:", placeholder="e.g. data: data frame containing covariates\nthreshold: cutoff score", key="manual_fn_params")
+        new_fn_usage = st.text_area("Usage Format:", placeholder="e.g. estimate_cox(heart_data, 0.5)", key="manual_fn_usage")
+        
+        code_source = st.radio(
+            "How to supply function code?",
+            options=["No Code (Signature Only)", "Paste Code Manually", "Upload R/txt File"],
+            key="manual_code_source"
+        )
+        
+        manual_code = ""
+        if code_source == "Paste Code Manually":
+            manual_code = st.text_area("Paste Function Code:", placeholder="estimate_cox <- function(data, threshold) {\n  ...\n}", key="manual_pasted_code")
+        elif code_source == "Upload R/txt File":
+            code_file = st.file_uploader("Upload Function Code File:", type=["R", "r", "txt"], key="manual_uploaded_code_file")
+            if code_file is not None:
+                try:
+                    manual_code = code_file.read().decode("utf-8", errors="ignore")
+                except Exception as e:
+                    st.error(f"Error reading file: {str(e)}")
+                    
+        add_btn = st.button("➕ Add Function to List", type="primary", use_container_width=True)
+        if add_btn:
+            if not new_fn_name.strip():
+                st.error("Function name cannot be empty.")
+            else:
+                cleaned_name = new_fn_name.strip()
+                # Check if already added
+                exists = False
+                for fn in st.session_state.added_functions:
+                    if fn["name"] == cleaned_name:
+                        exists = True
+                        break
+                if not exists:
+                    st.session_state.added_functions.append({
+                        "name": cleaned_name,
+                        "description": new_fn_desc.strip(),
+                        "parameters": new_fn_params.strip(),
+                        "usage": new_fn_usage.strip(),
+                        "code": manual_code,
+                        "mapped_package": mapped_package.strip(),
+                        "source": "Manually Added"
+                    })
+                    st.success(f"Added function: `{cleaned_name}`")
+                    st.rerun()
+                else:
+                    st.warning("Function already exists in the manually added list.")
+                        
+        # Display listed functions
+        st.markdown("### 🔎 Listed Functions")
+        
+        grouped_funcs = {}
+        
+        # From custom packages info
+        for info in st.session_state.custom_packages_info:
+            pkg_name = info.get("name", "Unknown Package")
+            pkg_type = info.get("type", "package")
+            funcs = info.get("functions", [])
+            docs = info.get("function_docs", {})
+            codes = info.get("function_codes", {})
+            params = info.get("function_params", {})
+            usage = info.get("function_usage", {})
+            
+            source_header = f"📦 Package: {pkg_name}" if pkg_type in ["package", "github_package"] else f"📄 Script: {pkg_name}"
+            grouped_funcs[source_header] = []
+            
+            for fn in funcs:
+                base = fn.split("(")[0].strip()
+                desc = docs.get(base, docs.get(fn, ""))
+                
+                # Fetch code details
+                fn_code = codes.get(fn, "")
+                fn_params = params.get(fn, "")
+                if not fn_params:
+                    fn_params = params.get(base, "")
+                fn_usage = usage.get(fn, "")
+                if not fn_usage:
+                    fn_usage = usage.get(base, "")
+                
+                grouped_funcs[source_header].append({
+                    "name": fn,
+                    "description": desc,
+                    "parameters": fn_params,
+                    "usage": fn_usage,
+                    "code": fn_code,
+                    "mapped_package": pkg_name if pkg_type in ["package", "github_package"] else "",
+                    "source": pkg_type.upper()
+                })
+                
+        # From manually added
+        if st.session_state.added_functions:
+            source_header = "➕ Manually Added Functions"
+            grouped_funcs[source_header] = []
+            for fn in st.session_state.added_functions:
+                grouped_funcs[source_header].append({
+                    "name": fn["name"],
+                    "description": fn.get("description", ""),
+                    "parameters": fn.get("parameters", ""),
+                    "usage": fn.get("usage", ""),
+                    "code": fn.get("code", ""),
+                    "mapped_package": fn.get("mapped_package", ""),
+                    "source": "Manually Added"
+                })
+                
+        if not grouped_funcs:
+            st.info("No functions currently registered. Upload files or use 'Add Function' form.")
+        else:
+            for source, funcs in grouped_funcs.items():
+                if funcs:
+                    st.markdown(f"#### {source}")
+                    for idx, fn in enumerate(funcs):
+                        display_label = f"⚙️ `{fn['name']}`"
+                        if fn.get("mapped_package"):
+                            display_label = f"📦 {fn['mapped_package']}::`{fn['name']}`"
+                            
+                        with st.expander(display_label, expanded=False):
+                            if fn.get("mapped_package"):
+                                st.markdown(f"**Mapped R Package:** `{fn['mapped_package']}`")
+                            
+                            if fn['description']:
+                                st.markdown(f"**Description:** {fn['description']}")
+                            else:
+                                st.markdown("*No description available.*")
+                                
+                            if fn.get("parameters"):
+                                st.markdown("**Parameters:**")
+                                st.text(fn["parameters"])
+                                
+                            if fn.get("usage"):
+                                st.markdown("**Usage:**")
+                                st.code(fn["usage"])
+                                
+                            if fn.get("code"):
+                                st.markdown("**Source Code:**")
+                                st.code(fn["code"], language="r")
+                            
+                            if fn['source'] == "Manually Added":
+                                if st.button("🗑️ Remove Function", key=f"del_fn_{source}_{idx}"):
+                                    st.session_state.added_functions = [f for f in st.session_state.added_functions if f["name"] != fn["name"]]
+                                    st.rerun()
+
+    # Step 1 Navigation
+    st.markdown("---")
+    col_prev, col_next = st.columns([1, 1])
+    with col_next:
+        if st.button("Next: App Structure & Mapping ➡️", type="primary", use_container_width=True):
+            st.session_state.step = 2
+            st.rerun()
+
+# ---------------------------------------------------------------------------
+# STEP 2: APP STRUCTURE & FUNCTION MAPPING
+# ---------------------------------------------------------------------------
+elif step == 2:
+    # Gather all available functions
+    all_available_functions = []
+    for info in st.session_state.custom_packages_info:
+        for fn in info.get("functions", []):
+            if fn not in all_available_functions:
+                all_available_functions.append(fn)
+    for fn in st.session_state.added_functions:
+        if fn["name"] not in all_available_functions:
+            all_available_functions.append(fn["name"])
+            
+    col_structure, col_mapping = st.columns([1, 1])
     
-    # Package selection
-    st.markdown("### 📦 Packages")
-    
-    # Run auto-extraction on current prompt
-    detected = extract_packages(user_prompt) if user_prompt else []
-    
-    # Display detected packages
-    if detected:
-        st.markdown("**Auto-detected packages:**")
-        html_tags = "".join([f'<span class="package-tag">{pkg}</span>' for pkg in detected])
-        st.markdown(html_tags, unsafe_allow_html=True)
-    
-    # Manual checklist
+    with col_structure:
+        st.markdown("### 📄 Page & Sub-page Configuration")
+        num_pages = st.number_input(
+            "Number of main pages/tabs:",
+            min_value=1,
+            max_value=20,
+            value=st.session_state.get("num_pages_val", 2),
+            step=1,
+            key="num_pages_val"
+        )
+        
+        pages_config = {}
+        
+        for p_idx in range(num_pages):
+            st.markdown("---")
+            st.markdown(f"##### 📁 Page {p_idx + 1}")
+            
+            page_title = st.text_input(
+                f"Page {p_idx + 1} Name",
+                value=f"Page {p_idx + 1}",
+                key=f"page_title_val_{p_idx}"
+            )
+            
+            num_subs = st.number_input(
+                f"Number of sub-pages for '{page_title}'",
+                min_value=0,
+                max_value=10,
+                value=0,
+                step=1,
+                key=f"num_subs_val_{p_idx}"
+            )
+            
+            pages_config[page_title] = {
+                "sub_pages": {}
+            }
+            
+            if num_subs > 0:
+                for s_idx in range(num_subs):
+                    sub_title = st.text_input(
+                        f"  Sub-page {s_idx + 1} Name",
+                        value=f"{page_title} Sub {s_idx + 1}",
+                        key=f"sub_title_val_{p_idx}_{s_idx}"
+                    )
+                    # Placeholder for mapped functions
+                    pages_config[page_title]["sub_pages"][sub_title] = []
+            else:
+                pages_config[page_title]["mapped_functions"] = []
+                
+    with col_mapping:
+        st.markdown("### 🔗 Function Mapping")
+        st.caption("Map custom functions to load and display on each page/sub-page.")
+        
+        if not all_available_functions:
+            st.warning("⚠️ No custom/loaded functions are registered from Step 1. You can continue, and the AI will generate placeholder tabs and charts, or you can map standard code.")
+            
+        # Dynamic Multiselect mapping using index-based keys for stable session states
+        for p_idx, (page_name, config) in enumerate(pages_config.items()):
+            st.markdown(f"##### 🗂️ {page_name}")
+            sub_pages = config.get("sub_pages", {})
+            if sub_pages:
+                for s_idx, sub_name in enumerate(sub_pages.keys()):
+                    mapped_funcs = st.multiselect(
+                        f"Functions for '{sub_name}':",
+                        options=all_available_functions,
+                        key=f"mapped_val_{p_idx}_{s_idx}"
+                    )
+                    pages_config[page_name]["sub_pages"][sub_name] = mapped_funcs
+            else:
+                mapped_funcs = st.multiselect(
+                    f"Functions for '{page_name}':",
+                    options=all_available_functions,
+                    key=f"mapped_val_{p_idx}"
+                )
+                pages_config[page_name]["mapped_functions"] = mapped_funcs
+                
+    # Layout and Themes options
+    st.markdown("---")
+    st.markdown("### 🎨 App Presentation & Package Settings")
+    col_lay, col_theme = st.columns(2)
+    with col_lay:
+        layout_style = st.selectbox(
+            "Layout style:",
+            options=[
+                "Auto (let the AI decide)",
+                "bslib dashboard — page_sidebar (filters left, content right)",
+                "bslib navbar tabs — page_navbar (multiple top tabs)",
+                "bslib cards grid — layout_columns / card()",
+                "Classic fluidPage + sidebarLayout",
+                "shinydashboard (header / sidebar / body)",
+            ],
+            index=0,
+            key="layout_style_val"
+        )
+    with col_theme:
+        ui_theme = st.selectbox(
+            "Theme (bslib bootswatch):",
+            options=["Auto / default", "flatly", "cosmo", "minty", "darkly", "cerulean", "journal", "lux", "sandstone"],
+            index=0,
+            key="ui_theme_val"
+        )
+        
+    st.markdown("##### 📦 Package Dependencies")
     selected_packages = st.multiselect(
-        "Manually specify packages to load/use:",
+        "Standard R packages to load/use:",
         options=sorted(COMMON_PACKAGES),
-        default=detected,
-        help="Select extra packages you want to guarantee are loaded in your shiny application."
+        default=["shiny", "bslib"] if "shiny" in COMMON_PACKAGES else [],
+        key="selected_packages_val"
     )
-    
-    # Text input for other custom/custom CRAN/Bioconductor packages
-    custom_packages_str = st.text_input(
-        "Additional packages (comma-separated):",
-        placeholder="e.g. survival, lme4, BiocManager"
-    )
-    
-    custom_packages = [p.strip() for p in custom_packages_str.split(",") if p.strip()]
-    
-    # 📁 Upload Custom R Packages / Scripts
-    st.markdown("### 📁 Upload Custom R Packages & Scripts")
-    uploaded_files = st.file_uploader(
-        "Upload personal R packages (.zip, .tar.gz) or custom scripts (.R) to include in context:",
-        type=["zip", "tar.gz", "R", "r"],
-        accept_multiple_files=True
-    )
-    
-    # 🐙 Import Custom R Packages from GitHub
-    st.markdown("### 🐙 Import R Packages from GitHub")
-    github_urls_str = st.text_area(
-        "Enter GitHub repository URLs (one per line or comma-separated):",
-        placeholder="e.g. https://github.com/r-lib/clipr\nhttps://github.com/r-lib/gargle",
+    custom_packages_str = st.text_area(
+        "Custom CRAN/Bioconductor packages to load (one per line or comma-separated):",
+        placeholder="e.g. survival\nlme4\nBiocManager",
+        key="custom_packages_str_val",
         height=100
     )
     
-    custom_packages_info = []
+    # Store finalized structural config in session state
+    st.session_state.pages_config = pages_config
     
-    # Process uploaded files
-    if uploaded_files:
-        for uploaded_file in uploaded_files:
-            file_name = uploaded_file.name
-            file_bytes = uploaded_file.read()
+    # Navigation
+    st.markdown("---")
+    col_prev, col_next = st.columns([1, 1])
+    with col_prev:
+        if st.button("⬅️ Back to Upload & Source", use_container_width=True):
+            st.session_state.step = 1
+            st.rerun()
+    with col_next:
+        if st.button("Next: Review & Generate ➡️", type="primary", use_container_width=True):
+            st.session_state.step = 3
+            st.rerun()
+
+# ---------------------------------------------------------------------------
+# STEP 3: REVIEW & CODE GENERATION
+# ---------------------------------------------------------------------------
+elif step == 3:
+    st.markdown("### 🚀 3. Compile and Generate R Shiny Code")
+    
+    # Retrieve configuration and selection variables
+    layout_style = st.session_state.get("layout_style_val", "Auto (let the AI decide)")
+    ui_theme = st.session_state.get("ui_theme_val", "Auto / default")
+    selected_packages = st.session_state.get("selected_packages_val", [])
+    custom_packages_str = st.session_state.get("custom_packages_str_val", "")
+    custom_packages = [p.strip() for p in re.split(r"[,\n]+", custom_packages_str) if p.strip()]
+    
+    col_gen_input, col_gen_output = st.columns([1, 1])
+    
+    with col_gen_input:
+        user_custom_notes = st.text_area(
+            "Describe the application requirements or styling guidelines (optional):",
+            value=st.session_state.get("app_prompt_val", ""),
+            placeholder="e.g. Add sliders to control thresholds, use a modern dark palette, add reactive plots using plotly.",
+            height=150,
+            key="app_prompt_val"
+        )
+        
+        # Build prompt
+        prompt_parts = []
+        prompt_parts.append("Generate a complete, single-file R Shiny application structure.")
+        
+        # Layout details
+        prompt_parts.append("\n### APPLICATION PAGE STRUCTURE:")
+        if not layout_style.startswith("Auto"):
+            prompt_parts.append(f"- Layout Style: {layout_style}")
+        if not ui_theme.startswith("Auto"):
+            prompt_parts.append(f"- Apply the bslib bootswatch theme '{ui_theme}' via bs_theme(bootswatch = \"{ui_theme}\").")
             
-            if file_name.endswith(".zip"):
-                info = parse_zip_package(file_bytes)
-                info["filename"] = file_name
-                custom_packages_info.append(info)
-            elif file_name.endswith(".tar.gz") or file_name.endswith(".tgz"):
-                info = parse_tar_package(file_bytes)
-                info["filename"] = file_name
-                custom_packages_info.append(info)
-            elif file_name.endswith(".R") or file_name.endswith(".r"):
-                file_content = file_bytes.decode("utf-8", errors="ignore")
-                info = parse_r_script(file_content, file_name)
-                custom_packages_info.append(info)
+        # Pages details
+        pages_config = st.session_state.get("pages_config", {})
+        for page_name, config in pages_config.items():
+            sub_pages = config.get("sub_pages", {})
+            if sub_pages:
+                prompt_parts.append(f"- Page: '{page_name}' containing sub-pages:")
+                for sub_name, funcs in sub_pages.items():
+                    func_str = ", ".join([f"`{f}`" for f in funcs]) if funcs else "none"
+                    prompt_parts.append(f"  - Sub-page: '{sub_name}' (uses functions: {func_str})")
+            else:
+                funcs = config.get("mapped_functions", [])
+                func_str = ", ".join([f"`{f}`" for f in funcs]) if funcs else "none"
+                prompt_parts.append(f"- Page: '{page_name}' (uses functions: {func_str})")
                 
-    # Process GitHub URLs
-    if github_urls_str:
-        # Split by comma or newline
-        urls = re.split(r"[,\n]+", github_urls_str)
-        github_urls = [u.strip() for u in urls if u.strip()]
-        
-        for url in github_urls:
-            owner, repo, branch = parse_github_url(url)
-            if owner and repo:
-                with st.spinner(f"Fetching {owner}/{repo} details from GitHub..."):
-                    info = get_cached_github_package(owner, repo, branch, github_token)
-                    info["url"] = url
-                    custom_packages_info.append(info)
-            else:
-                custom_packages_info.append({
-                    "name": url,
-                    "type": "github_package",
-                    "url": url,
-                    "error": f"Invalid GitHub URL format: '{url}'"
-                })
-        
-    # ------------------------------------------------------------------
-    # NEW: Interactive per-function selection.
-    # Instead of just previewing everything, let the user SEE each exported
-    # function with its description and CHOOSE which ones to feed to the LLM.
-    # ------------------------------------------------------------------
-    selected_functions_map = {}   # {package_key: [chosen function names]}
-    if custom_packages_info:
-        st.markdown("### 🔎 Choose Functions to Use")
-        st.caption("Pick exactly which functions from each package/script the AI is allowed to use. Descriptions are shown below each selector.")
-        for idx, info in enumerate(custom_packages_info):
-            # Stable key for widget state across reruns
-            pkg_key = info.get("url") or info.get("filename") or f"{info.get('name','pkg')}_{idx}"
-
-            if info.get("type") == "script":
-                st.markdown(f"📄 **Script File:** `{info['name']}`")
-            elif info.get("type") == "github_package":
-                if "error" in info:
-                    st.markdown(f"❌ **GitHub Package error (`{info['name']}`):** {info['error']}")
-                    st.markdown("---")
+        # Required packages
+        all_packages = list(set(selected_packages + custom_packages))
+        if all_packages:
+            prompt_parts.append(f"\n### REQUIRED R PACKAGES:\nLoad and use these R packages at the top: {', '.join(all_packages)}")
+            
+        # Custom source package / script details
+        custom_pkg_text = ""
+        if st.session_state.custom_packages_info:
+            custom_pkg_text = "\n### USER-SELECTED CUSTOM R PACKAGES & FUNCTIONS:\n"
+            for idx, info in enumerate(st.session_state.custom_packages_info):
+                if info.get("type") == "github_package" and "error" in info:
                     continue
-                st.markdown(f"🐙 **GitHub Package:** [{info['name']}]({info.get('url','')})")
+                pkg_key = info.get("url") or info.get("filename") or f"{info.get('name','pkg')}_{idx}"
+                
+                if info.get("type") == "script":
+                    custom_pkg_text += f"\nScript File: `{info['name']}`\n"
+                else:
+                    custom_pkg_text += f"\nPackage Name: `{info['name']}`\nDescription: {info.get('description', '')}\n"
+                    
+            custom_pkg_text += "\nWhen generating the R Shiny application code:\n- If a custom script is provided, advise sourcing it (e.g. source('script.R')) in comments to call custom functions.\n- Call custom functions reactively where mapped."
+            prompt_parts.append(custom_pkg_text)
+            
+        # Function specifications details (signatures, descriptions, code, params, usage)
+        used_functions = set()
+        for page_name, config in pages_config.items():
+            sub_pages = config.get("sub_pages", {})
+            if sub_pages:
+                for sub_name, funcs in sub_pages.items():
+                    used_functions.update(funcs)
             else:
-                st.markdown(f"📦 **R Package:** `{info['name']}` (from `{info.get('filename','')}`)")
+                used_functions.update(config.get("mapped_functions", []))
+                
+        if used_functions:
+            func_desc_map = {}
+            func_params_map = {}
+            func_usage_map = {}
+            func_code_map = {}
+            func_pkg_map = {}
+            
+            for info in st.session_state.custom_packages_info:
+                pkg_name = info.get("name", "")
+                pkg_type = info.get("type", "")
+                docs = info.get("function_docs", {})
+                codes = info.get("function_codes", {})
+                params = info.get("function_params", {})
+                usage = info.get("function_usage", {})
+                
+                for fn in info.get("functions", []):
+                    base = re.split(r"\(", fn, 1)[0].strip()
+                    desc = docs.get(base, docs.get(fn, ""))
+                    func_desc_map[fn] = desc
+                    func_params_map[fn] = params.get(fn, "")
+                    func_usage_map[fn] = usage.get(fn, "")
+                    func_code_map[fn] = codes.get(fn, "")
+                    if pkg_type in ["package", "github_package"]:
+                        func_pkg_map[fn] = pkg_name
 
-            if info.get("description"):
-                st.caption(info["description"])
-
-            functions = info.get("functions", [])
-            details = info.get("function_details") or [{"name": f, "description": ""} for f in functions]
-
-            if functions:
-                st.caption(f"Found **{len(functions)}** functions. Select the ones you want to use:")
-                chosen = st.multiselect(
-                    "Functions to include:",
-                    options=functions,
-                    default=functions,
-                    key=f"funcsel_{pkg_key}",
-                    label_visibility="collapsed",
-                )
-                selected_functions_map[pkg_key] = chosen
-
-                # Show name -> description so the choice is informed
-                with st.expander(f"ℹ️ Function descriptions ({info['name']})", expanded=False):
-                    for d in details:
-                        desc = d.get("description") or "_No description available._"
-                        st.markdown(f"- `{d['name']}` — {desc}")
+            for fn in st.session_state.added_functions:
+                name = fn["name"]
+                func_desc_map[name] = fn.get("description", "")
+                func_params_map[name] = fn.get("parameters", "")
+                func_usage_map[name] = fn.get("usage", "")
+                func_code_map[name] = fn.get("code", "")
+                func_pkg_map[name] = fn.get("mapped_package", "")
+                
+            prompt_parts.append("\n### FUNCTIONS SPECIFICATION (Implement and display outputs for these mapped functions):")
+            for fn in sorted(used_functions):
+                desc = func_desc_map.get(fn, "")
+                pkg = func_pkg_map.get(fn, "")
+                params = func_params_map.get(fn, "")
+                usage = func_usage_map.get(fn, "")
+                code = func_code_map.get(fn, "")
+                
+                func_prompt = f"- Function Name: `{fn}`\n"
+                if pkg:
+                    func_prompt += f"  - Maps to R package: `{pkg}` (so call it as `{pkg}::{fn.split('(')[0].strip()}` or ensure library({pkg}) is called)\n"
+                if desc:
+                    func_prompt += f"  - Mini Description: {desc}\n"
+                if params:
+                    func_prompt += f"  - Parameters: {params}\n"
+                if usage:
+                    func_prompt += f"  - Usage details: {usage}\n"
+                if code:
+                    func_prompt += f"  - Function reference R implementation code:\n  ```r\n{code}\n  ```\n"
+                prompt_parts.append(func_prompt)
+                
+        # Custom requirements
+        if user_custom_notes.strip():
+            prompt_parts.append(f"\n### USER ADDITIONAL REQUIREMENTS:\n{user_custom_notes.strip()}")
+            
+        llm_prompt = "\n".join(prompt_parts)
+        
+        # Expandable prompt preview
+        with st.expander("🔍 Preview Compiled LLM Prompt", expanded=False):
+            st.code(llm_prompt, language="markdown")
+            
+        # Generate code button
+        generate_btn = st.button("🚀 Generate R Shiny Code", type="primary", use_container_width=True)
+        
+        if generate_btn:
+            if provider != "Ollama" and not api_key:
+                st.error(f"Please provide an API Key for {provider} in the sidebar or in your `.env` file.")
             else:
-                st.markdown("_No functions detected._")
-                selected_functions_map[pkg_key] = []
-            st.markdown("---")
-
-    # ------------------------------------------------------------------
-    # NEW: Let the user choose the *form of presentation* (layout / theme /
-    # components) instead of leaving everything to the model.
-    # ------------------------------------------------------------------
-    st.markdown("### 🎨 App Layout & Presentation")
-    layout_style = st.selectbox(
-        "Layout style:",
-        options=[
-            "Auto (let the AI decide)",
-            "bslib dashboard — page_sidebar (filters left, content right)",
-            "bslib navbar tabs — page_navbar (multiple top tabs)",
-            "bslib cards grid — layout_columns / card()",
-            "Classic fluidPage + sidebarLayout",
-            "shinydashboard (header / sidebar / body)",
-        ],
-        index=0,
-    )
-    ui_theme = st.selectbox(
-        "Theme (bslib bootswatch):",
-        options=["Auto / default", "flatly", "cosmo", "minty", "darkly", "cerulean", "journal", "lux", "sandstone"],
-        index=0,
-    )
-    ui_components = st.multiselect(
-        "Components to include on the page:",
-        options=[
-            "Filter/input sidebar",
-            "Value boxes / KPI cards",
-            "Interactive plot(s)",
-            "Interactive data table (DT/reactable)",
-            "Tabs / multiple pages",
-            "Download button(s)",
-            "Text / summary panel",
-        ],
-        default=[],
-        help="These are passed to the AI as required UI elements. Leave empty to let the AI choose.",
-    )
-
-    # Button to generate code
-    generate_btn = st.button("🚀 Generate R Shiny Code")
-
-# Main Page Outputs
-with col_output:
-    st.markdown("### 💻 Generated R Shiny App Code")
-    
-    if generate_btn:
-        # Input Validation
-        if not user_prompt.strip():
-            st.error("Please enter a prompt first describing what app to build.")
-        elif provider != "Ollama" and not api_key:
-            st.error(f"Please provide an API Key for {provider} in the sidebar or in your `.env` file.")
-        else:
-            with st.spinner("Analyzing prompt and generating R code using the R Shiny Knowledge Base..."):
-                try:
-                    # 1. Load the knowledge base contents
-                    kb_content = load_knowledge_base()
-                    
-                    # 2. Build system and prompt
-                    all_packages = list(set(selected_packages + custom_packages))
-                    package_inst = ""
-                    if all_packages:
-                        package_inst = f"\n- Load and use these R packages: {', '.join(all_packages)}\n"
-                    
-                    custom_pkg_text = ""
-                    if custom_packages_info:
-                        custom_pkg_text = "\n### USER-SELECTED CUSTOM R PACKAGES & FUNCTIONS:\n"
-                        for idx, info in enumerate(custom_packages_info):
-                            if info.get("type") == "github_package" and "error" in info:
-                                continue
-                            pkg_key = info.get("url") or info.get("filename") or f"{info.get('name','pkg')}_{idx}"
-                            # Only the functions the user actually selected
-                            chosen = selected_functions_map.get(pkg_key, info.get("functions", []))
-                            docs = info.get("function_docs", {})
-
-                            def _doc_for(fn):
-                                base = re.split(r"\(", fn, 1)[0].strip()
-                                return docs.get(base, docs.get(fn, ""))
-
-                            if info.get("type") == "script":
-                                custom_pkg_text += f"\nScript File: `{info['name']}`\nSelected Functions (use ONLY these):\n"
-                            else:
-                                custom_pkg_text += f"\nPackage Name: `{info['name']}`\nDescription: {info.get('description', '')}\nSelected Functions (use ONLY these):\n"
-                            if chosen:
-                                for func in chosen:
-                                    d = _doc_for(func)
-                                    custom_pkg_text += f"- `{func}`" + (f" — {d}\n" if d else "\n")
-                            else:
-                                custom_pkg_text += "- (user selected no specific functions)\n"
-                        custom_pkg_text += """
-When generating the R Shiny application code:
-- If a package from this list is requested or relevant, load it using library(package_name). Prefer the user-selected functions above; do not invent other functions from these packages.
-- If a custom script is provided, write appropriate comments to advise the user to source the script (e.g., source("script_name.R")) to access those functions, and write code that utilizes those functions.
-"""
-
-                    # NEW: presentation / layout instructions chosen by the user
-                    presentation_text = ""
-                    layout_lines = []
-                    if layout_style and not layout_style.startswith("Auto"):
-                        layout_lines.append(f"- Use this layout style: {layout_style}.")
-                    if ui_theme and not ui_theme.startswith("Auto"):
-                        layout_lines.append(f"- Apply the bslib bootswatch theme '{ui_theme}' via bs_theme(bootswatch = \"{ui_theme}\").")
-                    if ui_components:
-                        layout_lines.append("- The page MUST include these components: " + ", ".join(ui_components) + ".")
-                    if layout_lines:
-                        presentation_text = "\n### USER-REQUESTED PRESENTATION / LAYOUT:\n" + "\n".join(layout_lines) + "\n"
-
-                    
-                    system_instruction = f"""You are a senior R Shiny developer.
+                with st.spinner("Analyzing structures and generating R Shiny application..."):
+                    try:
+                        kb_content = load_knowledge_base()
+                        
+                        system_instruction = f"""You are a senior R Shiny developer.
 Your task is to write a high-quality R Shiny application based on the user's requirements.
 You MUST strictly follow the conventions, layouts, design patterns, and performance/security guidelines described in the R Shiny Agent Knowledge Base below.
 
 ### R SHINY AGENT KNOWLEDGE BASE:
 {kb_content}
-{custom_pkg_text}
+
 ### EXPLICIT CODING DIRECTIONS:
 1. Always load the required packages at the top of the code (e.g., using `library()`).
 2. Use modern layout packages like `bslib` for styling where appropriate, or as specified in the knowledge base.
 3. Write clean, modular, and reactive code.
 4. Output ONLY the complete R code file content. Do not include markdown code block syntax (like ```r or ```) in your output—output raw R code only. No introductory or concluding text, just valid R code.
 """
+                        
+                        raw_output = call_llm(
+                            provider=provider,
+                            model_name=model_name,
+                            system_instruction=system_instruction,
+                            prompt=llm_prompt,
+                            api_key=api_key,
+                            ollama_host=ollama_host
+                        )
+                        
+                        cleaned_code = clean_r_code(raw_output)
+                        st.session_state.generated_code = cleaned_code
+                        st.success("App code generated successfully!")
+                    except Exception as e:
+                        st.error(f"Failed to generate application code: {str(e)}")
+                        if hasattr(e, 'response') and e.response is not None:
+                            st.code(e.response.text, language="json")
+                            
+    with col_gen_output:
+        st.markdown("### 💻 Generated R Shiny Code")
+        if "generated_code" in st.session_state:
+            st.code(st.session_state.generated_code, language="r")
+            
+            st.download_button(
+                label="💾 Download app.R",
+                data=st.session_state.generated_code,
+                file_name="app.R",
+                mime="text/plain",
+                use_container_width=True
+            )
+        else:
+            st.info("Ensure Step 1 and 2 are filled, then click 'Generate R Shiny Code' to view results.")
+            
+    # Step 3 Navigation
+    st.markdown("---")
+    if st.button("⬅️ Back to App Structure", use_container_width=True):
+        st.session_state.step = 2
+        st.rerun()
 
-                    prompt = f"""Generate an R Shiny application code based on the following user requirements:
-{user_prompt}
-{package_inst}
-{presentation_text}
-Remember to return ONLY the raw R code with no markdown wrapping or explanations.
-"""
-                    
-                    # 3. Call LLM API
-                    raw_output = call_llm(
-                        provider=provider,
-                        model_name=model_name,
-                        system_instruction=system_instruction,
-                        prompt=prompt,
-                        api_key=api_key,
-                        ollama_host=ollama_host
-                    )
-                    
-                    # 4. Clean code
-                    cleaned_code = clean_r_code(raw_output)
-                    
-                    # Save results to session state
-                    st.session_state.generated_code = cleaned_code
-                    st.success("App code generated successfully!")
-                    
-                except Exception as e:
-                    st.error(f"Failed to generate application code: {str(e)}")
-                    if hasattr(e, 'response') and e.response is not None:
-                        st.code(e.response.text, language="json")
-    
-    # Code display section
-    if "generated_code" in st.session_state:
-        # Code block representation
-        st.code(st.session_state.generated_code, language="r")
-        
-        # Download button
-        st.download_button(
-            label="💾 Download app.R",
-            data=st.session_state.generated_code,
-            file_name="app.R",
-            mime="text/plain"
-        )
-    else:
-        st.info("Fill out the prompt and configurations on the left, then click 'Generate R Shiny Code' to view output.")
+
