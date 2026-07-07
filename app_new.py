@@ -6,10 +6,123 @@ import os
 import zipfile
 import tarfile
 import io
+import random
+from datetime import datetime
 from dotenv import load_dotenv
 
 # Load environment variables
 load_dotenv()
+
+TOKEN_USAGE_FILE = "token_usage.json"
+SAVED_CHATS_FILE = "saved_chats.json"
+
+def load_token_usage():
+    if os.path.exists(TOKEN_USAGE_FILE):
+        try:
+            with open(TOKEN_USAGE_FILE, "r") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+def save_token_usage(usage):
+    try:
+        with open(TOKEN_USAGE_FILE, "w") as f:
+            json.dump(usage, f)
+    except Exception:
+        pass
+
+def get_daily_tokens(username):
+    usage = load_token_usage()
+    today = datetime.now().strftime("%Y-%m-%d")
+    user_data = usage.get(username, {})
+    return user_data.get(today, 0)
+
+def add_tokens(username, count):
+    usage = load_token_usage()
+    today = datetime.now().strftime("%Y-%m-%d")
+    if username not in usage:
+        usage[username] = {}
+    current = usage[username].get(today, 0)
+    usage[username][today] = current + count
+    save_token_usage(usage)
+
+def load_saved_chats(username):
+    if os.path.exists(SAVED_CHATS_FILE):
+        try:
+            with open(SAVED_CHATS_FILE, "r") as f:
+                all_chats = json.load(f)
+                return all_chats.get(username, [])
+        except Exception:
+            pass
+    return []
+
+def save_saved_chats(username, chats):
+    all_chats = {}
+    if os.path.exists(SAVED_CHATS_FILE):
+        try:
+            with open(SAVED_CHATS_FILE, "r") as f:
+                all_chats = json.load(f)
+        except Exception:
+            pass
+    all_chats[username] = chats
+    try:
+        with open(SAVED_CHATS_FILE, "w") as f:
+            json.dump(all_chats, f)
+    except Exception:
+        pass
+
+PROJECT_KEYS = [
+    "step", "custom_packages_info", "added_functions", "pages_config", 
+    "generated_code", "app_prompt_val", "num_pages_val", "layout_style_val", 
+    "ui_theme_val", "selected_packages_val", "custom_packages_str_val", "github_urls_input_val"
+]
+
+def load_project_to_state(project):
+    for key in PROJECT_KEYS:
+        if key in project:
+            st.session_state[key] = project[key]
+        else:
+            if key == "step":
+                st.session_state[key] = 1
+            elif key in ["custom_packages_info", "added_functions", "selected_packages_val"]:
+                st.session_state[key] = []
+            elif key == "pages_config":
+                st.session_state[key] = {}
+            elif key in ["generated_code", "app_prompt_val", "custom_packages_str_val", "github_urls_input_val"]:
+                st.session_state[key] = ""
+            elif key == "num_pages_val":
+                st.session_state[key] = 2
+            elif key in ["layout_style_val", "ui_theme_val"]:
+                st.session_state[key] = "Auto (let the AI decide)"
+    st.session_state.current_project_id = project.get("id")
+    st.session_state.current_project_name = project.get("name")
+
+def get_current_project_state(project_id, project_name):
+    project = {
+        "id": project_id,
+        "name": project_name,
+    }
+    for key in PROJECT_KEYS:
+        project[key] = st.session_state.get(key)
+    return project
+
+def save_current_project():
+    if "current_project_id" in st.session_state and st.session_state.current_project_id:
+        username = st.session_state.username
+        chats = load_saved_chats(username)
+        updated_project = get_current_project_state(st.session_state.current_project_id, st.session_state.current_project_name)
+        
+        found = False
+        for idx, ch in enumerate(chats):
+            if ch.get("id") == st.session_state.current_project_id:
+                chats[idx] = updated_project
+                found = True
+                break
+        if not found:
+            chats.append(updated_project)
+        save_saved_chats(username, chats)
+
 
 # Set up page config
 st.set_page_config(
@@ -725,6 +838,162 @@ def call_llm(provider, model_name, system_instruction, prompt, api_key, ollama_h
         
     return "Error: Unknown provider"
 
+def render_simulated_function(fn):
+    st.markdown(f"""
+    <div style="background-color: #ffffff; border: 1px solid #e9ecef; border-left: 4px solid #0054AD; padding: 15px; border-radius: 8px; margin-bottom: 20px; box-shadow: 0 2px 4px rgba(0,0,0,0.02);">
+        <span style="font-weight: 600; color: #0054AD;">📦 Mapped Endpoint:</span> <code>{fn}</code>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    try:
+        import numpy as np
+        import pandas as pd
+    except ImportError:
+        np = None
+        pd = None
+        
+    if np is None or pd is None:
+        st.warning("Numpy and Pandas are required to run the simulation. Showing code preview only.")
+        st.code(f"# Simulated call to {fn}")
+        return
+        
+    col_w1, col_w2 = st.columns([1, 2])
+    with col_w1:
+        st.markdown("**🔧 Inputs**")
+        slider_val = st.slider("Hazard Ratio / Effect Size Control", min_value=0.1, max_value=3.0, value=1.0, step=0.1, key=f"sim_slider_{fn}")
+        sample_size = st.number_input("Sample Size (N)", min_value=10, max_value=10000, value=100, step=10, key=f"sim_n_{fn}")
+        time_horizon = st.slider("Simulation Time Horizon (Days)", min_value=10, max_value=1000, value=365, step=10, key=f"sim_time_{fn}")
+        data_type = st.selectbox("Plot Type", ["Line Plot", "Bar Chart", "Area Chart"], key=f"sim_plot_type_{fn}")
+        
+    with col_w2:
+        st.markdown("**📊 Visual Output**")
+        t_grid = np.linspace(0, time_horizon, 50)
+        lam = 0.005
+        s_t = np.exp(-lam * t_grid * slider_val)
+        
+        # Add random noise
+        noise = np.random.normal(0, 0.02, len(t_grid))
+        s_t = np.clip(s_t + noise, 0, 1)
+        
+        df_sim = pd.DataFrame({
+            "Time (Days)": t_grid,
+            "Survival Probability": s_t,
+            "Reference Control": np.exp(-lam * t_grid)
+        }).set_index("Time (Days)")
+        
+        if data_type == "Line Plot":
+            st.line_chart(df_sim)
+        elif data_type == "Bar Chart":
+            st.bar_chart(df_sim)
+        else:
+            st.area_chart(df_sim)
+            
+        median_survival = "Infinity"
+        idx_below = np.where(s_t < 0.5)[0]
+        if len(idx_below) > 0:
+            median_survival = f"{int(t_grid[idx_below[0]]):,} days"
+            
+        df_stats = pd.DataFrame({
+            "Statistic": ["Median Survival Time", "Hazard Ratio (Input)", "Total Events Logged"],
+            "Value": [median_survival, f"{slider_val:.2f}", f"{int(sample_size * (1 - s_t[-1]))} events"]
+        })
+        st.dataframe(df_stats, hide_index=True, use_container_width=True)
+        
+        st.code(f"""
+[Shiny Server Output - {fn}]
+Evaluating black-box function call:
+> {fn.split('(')[0]}(data, HR = {slider_val}, N = {sample_size})
+Status: 200 OK
+Reactive chain execution completed in 0.04s.
+        """, language="r")
+
+# Initialize session state variables for authentication
+if "authenticated" not in st.session_state:
+    st.session_state.authenticated = False
+if "auth_step" not in st.session_state:
+    st.session_state.auth_step = "credentials"
+if "mfa_code" not in st.session_state:
+    st.session_state.mfa_code = None
+if "user_plan" not in st.session_state:
+    st.session_state.user_plan = "Free"
+if "username" not in st.session_state:
+    st.session_state.username = ""
+
+# Authentication screen
+if not st.session_state.authenticated:
+    st.markdown('<div class="main-header" style="text-align: center; margin-top: 50px;">R Shiny Code Generator</div>', unsafe_allow_html=True)
+    st.markdown('<div class="sub-header" style="text-align: center;">Secure Login Gateway</div>', unsafe_allow_html=True)
+    
+    col_l1, col_l2, col_l3 = st.columns([1, 2, 1])
+    with col_l2:
+        st.markdown('<div class="card">', unsafe_allow_html=True)
+        if st.session_state.auth_step == "credentials":
+            st.subheader("🔑 Step 1: Sign In")
+            username_input = st.text_input("Username / Email", key="username_input_val_login")
+            password_input = st.text_input("Password", type="password", key="password_input_val_login")
+            
+            # Simple credentials DB
+            users_db = {
+                "pro_user": {"password": "pro123", "plan": "Pro"},
+                "free_user": {"password": "free123", "plan": "Free"}
+            }
+            
+            if st.button("Continue ➡️", use_container_width=True):
+                if username_input in users_db and users_db[username_input]["password"] == password_input:
+                    st.session_state.username = username_input
+                    st.session_state.user_plan = users_db[username_input]["plan"]
+                    st.session_state.auth_step = "mfa"
+                    st.session_state.mfa_code = str(random.randint(100000, 999999))
+                    st.rerun()
+                else:
+                    st.error("Invalid username or password.")
+        
+        elif st.session_state.auth_step == "mfa":
+            st.subheader("📱 Step 2: Multi-Factor Verification")
+            st.write(f"Hello **{st.session_state.username}** ({st.session_state.user_plan} Plan).")
+            
+            # Simulated MFA Notification
+            st.markdown(f"""
+            <div style="background-color: #e3f2fd; border-left: 5px solid #0054AD; padding: 15px; border-radius: 8px; margin-bottom: 20px;">
+                <span style="font-weight: 600; color: #0d47a1;">📱 Simulated Authenticator notification:</span><br/>
+                Your one-time MFA passcode is: <strong style="font-size: 1.2rem; letter-spacing: 2px; color: #0d47a1;">{st.session_state.mfa_code}</strong>
+            </div>
+            """, unsafe_allow_html=True)
+            
+            mfa_input = st.text_input("Enter 6-digit Verification Code", placeholder="XXXXXX", key="mfa_code_input_val")
+            
+            col_m1, col_m2 = st.columns(2)
+            with col_m1:
+                if st.button("Verify & Login ✅", type="primary", use_container_width=True):
+                    if mfa_input.strip() == st.session_state.mfa_code:
+                        st.session_state.authenticated = True
+                        st.session_state.auth_step = "done"
+                        # Load projects
+                        chats = load_saved_chats(st.session_state.username)
+                        if chats:
+                            load_project_to_state(chats[-1])
+                        else:
+                            # default project
+                            proj_id = str(random.randint(10000000, 99999999))
+                            st.session_state.current_project_id = proj_id
+                            st.session_state.current_project_name = "Untitled Project"
+                            st.session_state.step = 1
+                            save_current_project()
+                        st.success("Successfully logged in!")
+                        st.rerun()
+                    else:
+                        st.error("Incorrect MFA passcode. Please try again.")
+            with col_m2:
+                if st.button("⬅️ Back to Login", use_container_width=True):
+                    st.session_state.auth_step = "credentials"
+                    st.session_state.username = ""
+                    st.session_state.user_plan = "Free"
+                    st.session_state.mfa_code = None
+                    st.rerun()
+                    
+        st.markdown('</div>', unsafe_allow_html=True)
+    st.stop()
+
 # Initialize session state variables
 if "step" not in st.session_state:
     st.session_state.step = 1
@@ -735,6 +1004,7 @@ if "added_functions" not in st.session_state:
 if "pages_config" not in st.session_state:
     st.session_state.pages_config = {}
 
+
 # --- MAIN APP LAYOUT ---
 
 st.markdown('<div class="main-header">R Shiny Code Generator</div>', unsafe_allow_html=True)
@@ -744,6 +1014,108 @@ st.markdown('<div class="sub-header">Generate clean, modern, and production-grad
 # Sidebar configuration
 with st.sidebar:
     st.header("⚙️ Configuration")
+    
+    # User Profile & Plan Info
+    st.markdown("### 👤 Profile")
+    st.write(f"Logged in: **{st.session_state.username}**")
+    st.write(f"Plan: **{st.session_state.user_plan}**")
+    
+    # Logout button
+    if st.button("🚪 Log Out", use_container_width=True):
+        st.session_state.authenticated = False
+        st.session_state.auth_step = "credentials"
+        st.session_state.username = ""
+        st.session_state.mfa_code = None
+        st.rerun()
+        
+    st.markdown("---")
+    
+    # Token Usage Tracker
+    st.markdown("### 📊 Daily Token Usage")
+    daily_tokens = get_daily_tokens(st.session_state.username)
+    token_limit = 500000 if st.session_state.user_plan == "Pro" else 15000
+    pct = min(100, int((daily_tokens / token_limit) * 100))
+    st.write(f"Usage: **{daily_tokens:,} / {token_limit:,}**")
+    st.progress(pct / 100.0)
+    if pct >= 100:
+        st.error("⚠️ Token limit exceeded for today!")
+        
+    st.markdown("---")
+    
+    # Context-based chats/projects list
+    st.markdown("### 📂 Saved Projects (Chats)")
+    username = st.session_state.username
+    chats = load_saved_chats(username)
+    
+    # Button to create a new project
+    if st.button("🆕 New Project", use_container_width=True):
+        # Save current project before switching
+        save_current_project()
+        
+        # Initialize fresh state
+        proj_id = str(random.randint(10000000, 99999999))
+        st.session_state.current_project_id = proj_id
+        st.session_state.current_project_name = "Untitled Project"
+        st.session_state.step = 1
+        
+        # Reset other keys
+        for key in PROJECT_KEYS:
+            if key == "step":
+                st.session_state[key] = 1
+            elif key in ["custom_packages_info", "added_functions", "selected_packages_val"]:
+                st.session_state[key] = []
+            elif key == "pages_config":
+                st.session_state[key] = {}
+            elif key in ["generated_code", "app_prompt_val", "custom_packages_str_val", "github_urls_input_val"]:
+                st.session_state[key] = ""
+            elif key == "num_pages_val":
+                st.session_state[key] = 2
+            elif key in ["layout_style_val", "ui_theme_val"]:
+                st.session_state[key] = "Auto (let the AI decide)"
+                
+        save_current_project()
+        st.success("New project started!")
+        st.rerun()
+        
+    if chats:
+        st.write("Your active projects:")
+        for ch in chats:
+            ch_id = ch.get("id")
+            ch_name = ch.get("name", "Untitled Project")
+            col_ch1, col_ch2 = st.columns([4, 1])
+            with col_ch1:
+                # Highlight active project
+                is_active = (st.session_state.get("current_project_id") == ch_id)
+                btn_label = f"📁 **{ch_name}**" if is_active else f"📄 {ch_name}"
+                if st.button(btn_label, key=f"load_ch_{ch_id}", use_container_width=True):
+                    # Save current before switching
+                    save_current_project()
+                    load_project_to_state(ch)
+                    st.rerun()
+            with col_ch2:
+                if st.button("❌", key=f"del_ch_{ch_id}", help="Delete Project"):
+                    updated_chats = [c for c in chats if c.get("id") != ch_id]
+                    save_saved_chats(username, updated_chats)
+                    # If we deleted the active project, load another or start new
+                    if st.session_state.get("current_project_id") == ch_id:
+                        if updated_chats:
+                            load_project_to_state(updated_chats[-1])
+                        else:
+                            st.session_state.current_project_id = str(random.randint(10000000, 99999999))
+                            st.session_state.current_project_name = "Untitled Project"
+                            st.session_state.step = 1
+                            save_current_project()
+                    st.rerun()
+                    
+        # Rename project inline
+        new_proj_name = st.text_input("Rename Active Project:", value=st.session_state.get("current_project_name", "Untitled Project"), key="rename_proj_input_val")
+        if new_proj_name.strip() and new_proj_name != st.session_state.get("current_project_name"):
+            st.session_state.current_project_name = new_proj_name.strip()
+            save_current_project()
+            st.rerun()
+            
+    st.markdown("---")
+
     
     # Model Provider Selection
     provider = st.selectbox(
@@ -1467,35 +1839,112 @@ You MUST strictly follow the conventions, layouts, design patterns, and performa
 10. Output ONLY the complete R code file content. Do not include markdown code block syntax (like ```r or ```) in your output—output raw R code only. No introductory or concluding text, just valid R code.
 """
                         
-                        raw_output = call_llm(
-                            provider=provider,
-                            model_name=model_name,
-                            system_instruction=system_instruction,
-                            prompt=llm_prompt,
-                            api_key=api_key,
-                            ollama_host=ollama_host
-                        )
+                        # Estimate prompt tokens
+                        prompt_tokens = (len(system_instruction) + len(llm_prompt)) // 4
+                        daily_tokens = get_daily_tokens(st.session_state.username)
+                        token_limit = 500000 if st.session_state.user_plan == "Pro" else 15000
                         
-                        cleaned_code = clean_r_code(raw_output)
-                        st.session_state.generated_code = cleaned_code
-                        st.success("App code generated successfully!")
+                        if daily_tokens >= token_limit:
+                            st.error("⚠️ Cannot generate code: Daily token limit reached. Please upgrade to Pro or wait until tomorrow.")
+                        else:
+                            raw_output = call_llm(
+                                provider=provider,
+                                model_name=model_name,
+                                system_instruction=system_instruction,
+                                prompt=llm_prompt,
+                                api_key=api_key,
+                                ollama_host=ollama_host
+                            )
+                            
+                            # Estimate response tokens and accumulate
+                            response_tokens = len(raw_output) // 4
+                            total_consumed = prompt_tokens + response_tokens
+                            add_tokens(st.session_state.username, total_consumed)
+                            
+                            cleaned_code = clean_r_code(raw_output)
+                            st.session_state.generated_code = cleaned_code
+                            save_current_project()
+                            st.success(f"App code generated successfully! Consumed ~{total_consumed} tokens.")
+                            st.rerun()
                     except Exception as e:
                         st.error(f"Failed to generate application code: {str(e)}")
                         if hasattr(e, 'response') and e.response is not None:
                             st.code(e.response.text, language="json")
                             
     with col_gen_output:
-        st.markdown("### 💻 Generated R Shiny Code")
         if "generated_code" in st.session_state:
-            st.code(st.session_state.generated_code, language="r")
+            tab_code, tab_preview = st.tabs(["💻 R Shiny Code", "👁️ Live App Preview"])
             
-            st.download_button(
-                label="💾 Download app.R",
-                data=st.session_state.generated_code,
-                file_name="app.R",
-                mime="text/plain",
-                use_container_width=True
-            )
+            with tab_code:
+                st.markdown("### 💻 Generated R Shiny Code")
+                st.code(st.session_state.generated_code, language="r")
+                
+                st.download_button(
+                    label="💾 Download app.R",
+                    data=st.session_state.generated_code,
+                    file_name="app.R",
+                    mime="text/plain",
+                    use_container_width=True
+                )
+                
+            with tab_preview:
+                st.markdown("### 👁️ Live Interactive App Preview")
+                if st.session_state.user_plan == "Free":
+                    st.markdown("""
+                    <div style="background-color: #fff3cd; border-left: 5px solid #ffc107; padding: 20px; border-radius: 8px; text-align: center; margin-top: 30px;">
+                        <h3 style="color: #856404; margin-top: 0;">🔒 Pro Feature Required</h3>
+                        <p style="color: #856404;">The <strong>Live Interactive App Preview</strong> allows Pro plan subscribers to test their dashboard widgets and visualize generated code live inside the generator without downloading.</p>
+                        <p style="font-weight: bold; color: #856404;">Please log in as <code>pro_user</code> to access this feature.</p>
+                    </div>
+                    """, unsafe_allow_html=True)
+                else:
+                    pages_config = st.session_state.get("pages_config", {})
+                    if not pages_config:
+                        st.info("No pages or tabs configured in Step 2. Please configure them to view the interactive preview.")
+                    else:
+                        st.markdown("""
+                        <div style="background-color: #f1f3f5; border: 1px solid #dee2e6; padding: 10px; border-radius: 6px; margin-bottom: 20px; font-family: monospace; font-size: 0.9rem; color: #495057;">
+                            🌐 <b>Simulated R Shiny Application Frame</b>
+                        </div>
+                        """, unsafe_allow_html=True)
+                        
+                        layout_style = st.session_state.get("layout_style_val", "Auto (let the AI decide)")
+                        ui_theme = st.session_state.get("ui_theme_val", "Auto / default")
+                        st.caption(f"Theme applied: `{ui_theme}` | Layout: `{layout_style}`")
+                        
+                        # Render simulated pages tabs
+                        page_titles = list(pages_config.keys())
+                        sim_tabs = st.tabs(page_titles)
+                        
+                        for idx, tab in enumerate(sim_tabs):
+                            page_name = page_titles[idx]
+                            config = pages_config[page_name]
+                            
+                            with tab:
+                                st.markdown(f"#### 📁 {page_name}")
+                                
+                                sub_pages = config.get("sub_pages", {})
+                                if sub_pages:
+                                    sub_titles = list(sub_pages.keys())
+                                    sub_tabs = st.tabs(sub_titles)
+                                    
+                                    for s_idx, s_tab in enumerate(sub_tabs):
+                                        sub_name = sub_titles[s_idx]
+                                        funcs = sub_pages[sub_name]
+                                        with s_tab:
+                                            st.markdown(f"##### 📄 {sub_name}")
+                                            if not funcs:
+                                                st.info("No functions mapped to this sub-page.")
+                                            else:
+                                                for fn in funcs:
+                                                    render_simulated_function(fn)
+                                else:
+                                    funcs = config.get("mapped_functions", [])
+                                    if not funcs:
+                                        st.info("No functions mapped to this page.")
+                                    else:
+                                        for fn in funcs:
+                                            render_simulated_function(fn)
         else:
             st.info("Ensure Step 1 and 2 are filled, then click 'Generate R Shiny Code' to view results.")
             
@@ -1504,5 +1953,10 @@ You MUST strictly follow the conventions, layouts, design patterns, and performa
     if st.button("⬅️ Back to App Structure", use_container_width=True):
         st.session_state.step = 2
         st.rerun()
+
+# Automatically save project state on any user interaction if authenticated
+if st.session_state.get("authenticated"):
+    save_current_project()
+
 
 
