@@ -210,24 +210,48 @@ def parse_rd_file(rd_text):
         names.add(m.strip())
     for m in re.findall(r"\\alias\{([^}]*)\}", rd_text):
         names.add(m.strip())
-        
+
     desc = _clean_doc_text(_extract_braced_block(rd_text, "title"))
     if not desc:
         long_desc = _clean_doc_text(_extract_braced_block(rd_text, "description"))
         desc = long_desc[:160].strip()
-        
+
     usage = _clean_doc_text(_extract_braced_block(rd_text, "usage"))
     arguments_raw = _extract_braced_block(rd_text, "arguments")
     arguments = _clean_arguments_block(arguments_raw)
-    
+    # Examples are runnable R code — keep raw (no whitespace collapsing)
+    examples = _extract_braced_block(rd_text, "examples").strip()
+    returns = _clean_doc_text(_extract_braced_block(rd_text, "value"))
+
     for n in names:
         if n:
             docs[n] = {
                 "description": desc,
                 "usage": usage,
-                "parameters": arguments
+                "parameters": arguments,
+                "examples": examples,
+                "returns": returns
             }
     return docs
+
+# Extract {function_name: full_source} from raw R source using balanced-brace matching
+def extract_function_bodies(file_content):
+    bodies = {}
+    for match in re.finditer(r"([a-zA-Z0-9_\.]+)\s*(?:<-|=)\s*function\s*\(", file_content):
+        func_name = match.group(1).strip()
+        brace_start = file_content.find("{", match.end())
+        if brace_start == -1:
+            continue
+        depth = 1
+        i = brace_start + 1
+        while i < len(file_content) and depth > 0:
+            if file_content[i] == "{":
+                depth += 1
+            elif file_content[i] == "}":
+                depth -= 1
+            i += 1
+        bodies[func_name] = file_content[match.start():i]
+    return bodies
 
 # Parse roxygen (#') comment blocks from raw R source -> {func_name: metadata_dict}
 def parse_roxygen_docs(file_content):
@@ -318,9 +342,21 @@ def parse_zip_package(file_bytes):
                         docs.update(parse_rd_file(rd_text))
                     except Exception:
                         pass
+            # Read R/*.R source files to capture real function bodies
+            bodies = {}
+            for name in z.namelist():
+                if re.search(r"(^|/)R/[^/]+\.[rR]$", name):
+                    try:
+                        src_text = z.read(name).decode("utf-8", errors="ignore")
+                        bodies.update(extract_function_bodies(src_text))
+                    except Exception:
+                        pass
             metadata["function_docs"] = {k: v["description"] for k, v in docs.items()}
             metadata["function_params"] = {k: v["parameters"] for k, v in docs.items()}
             metadata["function_usage"] = {k: v["usage"] for k, v in docs.items()}
+            metadata["function_examples"] = {k: v.get("examples", "") for k, v in docs.items()}
+            metadata["function_returns"] = {k: v.get("returns", "") for k, v in docs.items()}
+            metadata["function_codes"] = bodies
             metadata["function_details"] = build_function_details(metadata["functions"], metadata["function_docs"])
     except Exception as e:
         metadata["error"] = f"ZIP parsing error: {str(e)}"
@@ -371,9 +407,23 @@ def parse_tar_package(file_bytes):
                             docs.update(parse_rd_file(rd_text))
                     except Exception:
                         pass
+            # Read R/*.R source files to capture real function bodies
+            bodies = {}
+            for member in tar.getmembers():
+                if re.search(r"(^|/)R/[^/]+\.[rR]$", member.name):
+                    try:
+                        rf = tar.extractfile(member)
+                        if rf:
+                            src_text = rf.read().decode("utf-8", errors="ignore")
+                            bodies.update(extract_function_bodies(src_text))
+                    except Exception:
+                        pass
             metadata["function_docs"] = {k: v["description"] for k, v in docs.items()}
             metadata["function_params"] = {k: v["parameters"] for k, v in docs.items()}
             metadata["function_usage"] = {k: v["usage"] for k, v in docs.items()}
+            metadata["function_examples"] = {k: v.get("examples", "") for k, v in docs.items()}
+            metadata["function_returns"] = {k: v.get("returns", "") for k, v in docs.items()}
+            metadata["function_codes"] = bodies
             metadata["function_details"] = build_function_details(metadata["functions"], metadata["function_docs"])
     except Exception as e:
         metadata["error"] = f"tar.gz parsing error: {str(e)}"
@@ -538,6 +588,7 @@ def fetch_github_package(owner, repo, branch=None, github_token=None):
         #    number of .Rd files. Fully optional: any failure just means no
         #    descriptions, functions are still listed.
         docs = {}
+        bodies = {}
         try:
             tree_url = f"https://api.github.com/repos/{owner}/{repo}/git/trees/{active_branch}?recursive=1"
             tree_res = requests.get(tree_url, headers=headers, timeout=5)
@@ -554,11 +605,26 @@ def fetch_github_package(owner, repo, branch=None, github_token=None):
                     rd_res = requests.get(rd_raw, headers=headers, timeout=5)
                     if rd_res.status_code == 200:
                         docs.update(parse_rd_file(rd_res.text))
+                # R/*.R source files give the real function bodies
+                r_paths = [
+                    t["path"] for t in tree
+                    if t.get("type") == "blob"
+                    and t.get("path", "").startswith("R/")
+                    and t.get("path", "").lower().endswith(".r")
+                ]
+                for path in r_paths[:40]:  # cap to protect against huge repos / rate limits
+                    r_raw = f"https://raw.githubusercontent.com/{owner}/{repo}/{active_branch}/{path}"
+                    r_res = requests.get(r_raw, headers=headers, timeout=5)
+                    if r_res.status_code == 200:
+                        bodies.update(extract_function_bodies(r_res.text))
         except Exception:
             pass
         metadata["function_docs"] = {k: v["description"] for k, v in docs.items()}
         metadata["function_params"] = {k: v["parameters"] for k, v in docs.items()}
         metadata["function_usage"] = {k: v["usage"] for k, v in docs.items()}
+        metadata["function_examples"] = {k: v.get("examples", "") for k, v in docs.items()}
+        metadata["function_returns"] = {k: v.get("returns", "") for k, v in docs.items()}
+        metadata["function_codes"] = bodies
         metadata["function_details"] = build_function_details(metadata.get("functions", []), metadata["function_docs"])
 
     except Exception as e:
@@ -849,6 +915,7 @@ if step == 1:
         new_fn_desc = st.text_input("Mini Description:", placeholder="e.g. Fit a Cox proportional hazards model.", key="manual_fn_desc")
         new_fn_params = st.text_area("Parameters:", placeholder="e.g. data: data frame containing covariates\nthreshold: cutoff score", key="manual_fn_params")
         new_fn_usage = st.text_area("Usage Format:", placeholder="e.g. estimate_cox(heart_data, 0.5)", key="manual_fn_usage")
+        new_fn_returns = st.text_input("Returns (object class/structure, optional):", placeholder="e.g. a coxph fit object with fields coef, var, loglik", key="manual_fn_returns")
         
         code_source = st.radio(
             "How to supply function code?",
@@ -885,6 +952,7 @@ if step == 1:
                         "description": new_fn_desc.strip(),
                         "parameters": new_fn_params.strip(),
                         "usage": new_fn_usage.strip(),
+                        "returns": new_fn_returns.strip(),
                         "code": manual_code,
                         "mapped_package": mapped_package.strip(),
                         "source": "Manually Added"
@@ -1209,7 +1277,7 @@ elif step == 3:
                 else:
                     custom_pkg_text += f"\nPackage Name: `{info['name']}`\nDescription: {info.get('description', '')}\n"
                     
-            custom_pkg_text += "\nWhen generating the R Shiny application code:\n- If a custom script is provided, advise sourcing it (e.g. source('script.R')) in comments to call custom functions.\n- Call custom functions reactively where mapped."
+            custom_pkg_text += "\nWhen generating the R Shiny application code:\n- If a custom script is provided, advise sourcing it (e.g. source('script.R')) in comments to call custom functions.\n- Call custom functions reactively where mapped.\n- These are custom/non-CRAN packages: do NOT guess their function signatures, argument names, or argument types. Use only what the FUNCTIONS SPECIFICATION below provides; if a signature is missing, mark the call with a '# WARNING: UNVERIFIED CALL' comment advising the user to check formals(pkg::fn) and ?pkg::fn."
             prompt_parts.append(custom_pkg_text)
             
         # Function specifications details (signatures, descriptions, code, params, usage)
@@ -1223,12 +1291,15 @@ elif step == 3:
                 used_functions.update(config.get("mapped_functions", []))
                 
         if used_functions:
+            NOT_PROVIDED = "NOT PROVIDED"
             func_desc_map = {}
             func_params_map = {}
-            func_usage_map = {}
+            func_sig_map = {}
+            func_example_map = {}
+            func_returns_map = {}
             func_code_map = {}
             func_pkg_map = {}
-            
+
             for info in st.session_state.custom_packages_info:
                 pkg_name = info.get("name", "")
                 pkg_type = info.get("type", "")
@@ -1236,14 +1307,17 @@ elif step == 3:
                 codes = info.get("function_codes", {})
                 params = info.get("function_params", {})
                 usage = info.get("function_usage", {})
-                
+                examples = info.get("function_examples", {})
+                returns = info.get("function_returns", {})
+
                 for fn in info.get("functions", []):
                     base = re.split(r"\(", fn, 1)[0].strip()
-                    desc = docs.get(base, docs.get(fn, ""))
-                    func_desc_map[fn] = desc
-                    func_params_map[fn] = params.get(fn, "")
-                    func_usage_map[fn] = usage.get(fn, "")
-                    func_code_map[fn] = codes.get(fn, "")
+                    func_desc_map[fn] = docs.get(base, docs.get(fn, ""))
+                    func_params_map[fn] = params.get(fn, params.get(base, ""))
+                    func_sig_map[fn] = usage.get(fn, usage.get(base, ""))
+                    func_example_map[fn] = examples.get(fn, examples.get(base, ""))
+                    func_returns_map[fn] = returns.get(fn, returns.get(base, ""))
+                    func_code_map[fn] = codes.get(fn, codes.get(base, ""))
                     if pkg_type in ["package", "github_package"]:
                         func_pkg_map[fn] = pkg_name
 
@@ -1251,30 +1325,106 @@ elif step == 3:
                 name = fn["name"]
                 func_desc_map[name] = fn.get("description", "")
                 func_params_map[name] = fn.get("parameters", "")
-                func_usage_map[name] = fn.get("usage", "")
+                # Manual entries put the signature in the name ("fn(arg1, arg2)")
+                func_sig_map[name] = name if "(" in name else ""
+                func_example_map[name] = fn.get("usage", "")
+                func_returns_map[name] = fn.get("returns", "")
                 func_code_map[name] = fn.get("code", "")
                 func_pkg_map[name] = fn.get("mapped_package", "")
-                
-            prompt_parts.append("\n### FUNCTIONS SPECIFICATION (Implement and display outputs for these mapped functions):")
+
+            def _fn_base(f):
+                return re.split(r"\(", f, 1)[0].strip()
+
+            # Upstream dependencies: other functions of the same package that this
+            # function's docs, example, or source body reference
+            def detect_dependencies(fn):
+                deps = []
+                search_text = "\n".join([
+                    func_params_map.get(fn, ""), func_sig_map.get(fn, ""),
+                    func_example_map.get(fn, ""), func_code_map.get(fn, ""),
+                ])
+                fn_base = _fn_base(fn)
+                for other in func_desc_map:
+                    other_base = _fn_base(other)
+                    if other == fn or other_base == fn_base:
+                        continue
+                    if func_pkg_map.get(other, "") != func_pkg_map.get(fn, ""):
+                        continue
+                    pat_call = r"\b" + re.escape(other_base) + r"\s*\("
+                    pat_ref = r"(?:by|of|from)\s+`?" + re.escape(other_base) + r"`?\b"
+                    if re.search(pat_call, search_text) or re.search(pat_ref, search_text):
+                        deps.append(other)
+                return deps
+
+            prompt_parts.append("\n### FUNCTIONS SPECIFICATION (Implement and display outputs for these mapped functions):\nEach block below carries the function's real API extracted from the package (signature, source, runnable example, return value, upstream dependencies). Fields marked NOT PROVIDED could not be extracted — the USAGE INSTRUCTIONS after the blocks say how to handle them.")
             for fn in sorted(used_functions):
                 desc = func_desc_map.get(fn, "")
                 pkg = func_pkg_map.get(fn, "")
-                params = func_params_map.get(fn, "")
-                usage = func_usage_map.get(fn, "")
-                code = func_code_map.get(fn, "")
-                
+                params = func_params_map.get(fn, "").strip()
+                sig = func_sig_map.get(fn, "").strip()
+                example = func_example_map.get(fn, "").strip()
+                returns_val = func_returns_map.get(fn, "").strip()
+                code = func_code_map.get(fn, "").strip()
+
                 func_prompt = f"- Function Name: `{fn}`\n"
                 if pkg:
                     func_prompt += f"  - Maps to R package: `{pkg}` (so call it as `{pkg}::{fn.split('(')[0].strip()}` or ensure library({pkg}) is called)\n"
                 if desc:
                     func_prompt += f"  - Mini Description: {desc}\n"
+                func_prompt += f"  - Signature (formals): {sig if sig else NOT_PROVIDED}\n"
                 if params:
-                    func_prompt += f"  - Parameters: {params}\n"
-                if usage:
-                    func_prompt += f"  - Usage details: {usage}\n"
+                    func_prompt += f"  - Parameters (documented arguments): {params}\n"
                 if code:
-                    func_prompt += f"  - Function reference R implementation code:\n  ```r\n{code}\n  ```\n"
+                    func_prompt += f"  - Source / Reference Implementation:\n  ```r\n{code}\n  ```\n"
+                else:
+                    func_prompt += f"  - Source / Reference Implementation: {NOT_PROVIDED}\n"
+                if example:
+                    func_prompt += f"  - Full Example (runnable):\n  ```r\n{example}\n  ```\n"
+                else:
+                    func_prompt += f"  - Full Example (runnable): {NOT_PROVIDED}\n"
+                func_prompt += f"  - Returns: {returns_val if returns_val else NOT_PROVIDED}\n"
+
+                deps = detect_dependencies(fn)
+                if deps:
+                    func_prompt += "  - Dependency Functions (upstream functions this one needs):\n"
+                    for dep in deps:
+                        dep_sig = func_sig_map.get(dep, "").strip()
+                        dep_code = func_code_map.get(dep, "").strip()
+                        dep_ex = func_example_map.get(dep, "").strip()
+                        dep_ret = func_returns_map.get(dep, "").strip()
+                        func_prompt += f"    - `{dep}`:\n"
+                        func_prompt += f"      - Signature (formals): {dep_sig if dep_sig else NOT_PROVIDED}\n"
+                        if dep in used_functions and (dep_code or dep_ex):
+                            func_prompt += "      - Source / Full Example: see this function's own block in this specification\n"
+                        else:
+                            if dep_code:
+                                func_prompt += f"      - Source / Reference Implementation:\n      ```r\n{dep_code}\n      ```\n"
+                            else:
+                                func_prompt += f"      - Source / Reference Implementation: {NOT_PROVIDED}\n"
+                            if dep_ex:
+                                func_prompt += f"      - Full Example (runnable):\n      ```r\n{dep_ex}\n      ```\n"
+                            else:
+                                func_prompt += f"      - Full Example (runnable): {NOT_PROVIDED}\n"
+                        func_prompt += f"      - Returns: {dep_ret if dep_ret else NOT_PROVIDED}\n"
+                else:
+                    func_prompt += f"  - Dependency Functions: {NOT_PROVIDED} (none auto-detected — re-check the parameter descriptions and example above for objects produced by other package functions)\n"
                 prompt_parts.append(func_prompt)
+
+            prompt_parts.append("""### FUNCTIONS SPECIFICATION USAGE INSTRUCTIONS:
+1. When Source / Reference Implementation is provided, treat it as the HIGHEST-AUTHORITY source — above the Parameters prose and above the Signature line. Read the body to determine: exact argument names and defaults, how each argument is consumed (e.g. whether a hazard argument is called as a function, integrated, or indexed as a vector), the class and fields of the returned object, and any internal preconditions (like a setting that must be present for a downstream function to work).
+2. When building a page, generate calls that match how the source actually uses arguments, not how the description phrases them. If the body integrates or vectorizes over an argument, supply that argument in the form the body expects. If the body reads specific fields off an input object, ensure the upstream constructor call produces those fields.
+3. Preserve the object flow the code reveals. If an endpoint's body reads fields written by an upstream constructor, generate the full constructor -> object -> endpoint chain using both functions' real signatures, with any required settings (such as show.setting = "Y") passed on the constructor call itself.
+4. Source is for UNDERSTANDING, not reimplementation. The Source / Reference Implementation is provided only so you can read a function's arguments, object flow, and preconditions. NEVER reimplement, split, or copy from it — do not lift sections, loops, or plot calls out of a function body into the app. Call the mapped function as a single BLACK BOX and handle only its return value or its side effects. If the body contains multiple internal steps (several plots, several computations), those are internal to that one call, not separate outputs to expose as separate panels.
+5. Match the OUTPUT WRAPPER to the function's output mode, which you determine from Source and Returns:
+   - Draws base-R graphics as a side effect (body calls plot(), lines(), abline(), etc. and returns nothing or invisibly): call it ONCE inside ONE renderPlot on one device. If the body produces multiple base plots, set par(mfrow = c(rows, cols)) sized to the number of plots, capture and restore par with on.exit(), and give the single plotOutput a height large enough for the grid. Do NOT create one panel per internal plot.
+   - Returns a ggplot object: capture it and print() it in renderPlot, or pass it to the appropriate ggplot output. One returned object, one output.
+   - Returns a list of plot objects or a combined object (patchwork/grid): render according to that structure, still from the single returned value — do not re-derive the pieces yourself.
+   - Output mode unclear (Returns is NOT PROVIDED and the body is truncated): do NOT guess a decomposition. Call the function once into a single output and add a comment noting the output mode is unverified and the user should confirm whether it draws directly, returns a plot object, or returns a list.
+   GOVERNING PRINCIPLE: the number of outputs in the app is determined by the number of times you CALL mapped functions, not by the number of plots or steps inside those functions. One mapped function call produces one output region unless the function's documented return value is explicitly a collection meant to be shown separately.
+6. UNDOCUMENTED INTERNAL HELPERS signal an unverified object contract. A mapped function's body may call a helper that is NOT documented in the spec, on its own input object (e.g. `nph = f.extract(nphDesign)` at the top of display.nphDesign). The fields that helper reads off the object are a HIDDEN CONTRACT: the object from the upstream constructor must contain them, but that contract is not written down. Do NOT try to reconstruct which fields the helper needs, and do NOT trim, reshape, or "optimize" the constructor call to only the fields you think are used. Instead, replicate the documented constructor example EXACTLY as given and assume its output is a compatible object. Add a comment naming the undocumented helper as an unverified internal dependency, e.g.: `# NOTE: display.nphDesign calls f.extract() internally; the object from finalize.nphDesign is assumed compatible. Verify with str() on the constructor output if this errors.` Reason: when an endpoint reads its input through an undocumented extractor, a technically-correct constructor call can still produce an object that fails deep inside the black box with an error that gives no hint of the real cause. Constructor fidelity is the only defense — replicate the example rather than reasoning about internals.
+7. VALIDATE LENGTHS of related vector inputs before calling. When the source shows multiple arguments that must have matching or related lengths (revealed by the body indexing them together, e.g. `alpha[i]`, `T[j]`, or derived relationships like `K = length(f.ws)` and `timing = targetEvents/targetEvents[K]`), validate those lengths in the server with `shiny::validate()` + `need()` and show a clear message BEFORE making the call — do not pass mismatched vectors into the function. When an input arrives as comma-separated text (analysis times, alpha values), parse it to numeric explicitly and check BOTH that parsing succeeded (no NAs) AND that the resulting length matches the related arguments; never pass unparsed strings or length-mismatched vectors into a mapped function. Reason: a length mismatch among parallel vector arguments detonates inside the function as a "wrong length" or "length zero" error that is hard to trace back to the input. Guarding lengths at the boundary turns an opaque internal crash into a clear user-facing message.
+8. If Signature and Source are both NOT PROVIDED for a required function (including a Dependency Function), do NOT invent them. A Source body that is TRUNCATED (cut off mid-function) counts as NOT PROVIDED for any function the app would call DIRECTLY — apply the same handling. Mark the call `# WARNING: UNVERIFIED CALL`, name the specific function, and tell the user to run `formals(pkg::fn)`, `print(pkg::fn)`, and `?pkg::fn` and paste the FULL body back. A function is only safe to generate as verified when its real signature or complete source was supplied. (A truncated body IS still usable for a function that is only an internal dependency the app never calls directly — see rule 6.)
+9. All prior rules remain in force: exact argument names/types, replicate documented examples over prose-built calls, vectorize functions passed to numerical routines to return length(t) values when the source confirms the argument is function-valued, and every function in the call chain must have a verified signature before the app is complete.""")
                 
         # Custom requirements
         if user_custom_notes.strip():
@@ -1309,8 +1459,12 @@ You MUST strictly follow the conventions, layouts, design patterns, and performa
 2. Use modern layout packages like `bslib` for styling where appropriate, or as specified in the knowledge base.
 3. Write clean, modular, and reactive code.
 4. VECTORIZATION (critical): any function passed to `integrate()`, `curve()`, `outer()`, `optimize()`, `uniroot()`, or used to compute hazard/survival/density curves MUST return a vector the same length as its input. Wrap constants in `rep(value, length(t))`, use `ifelse()`/`pmin()`/`pmax()` instead of `if`/`else` inside such functions, compute cumulative integrals per time point with `sapply(t_grid, function(tt) integrate(f, 0, tt)$value)`, and extract `$value` from `integrate()` results. Follow ALL rules in Knowledge Base sections 14.4 and 14.5.
-5. Guard every render/reactive on the inputs it reads using `req()` so the app does not error before the user provides inputs.
-6. Output ONLY the complete R code file content. Do not include markdown code block syntax (like ```r or ```) in your output—output raw R code only. No introductory or concluding text, just valid R code.
+5. CUSTOM PACKAGE APIS (critical): for functions from custom/non-CRAN packages, NEVER guess signatures, argument names, or argument types. Each FUNCTIONS SPECIFICATION block carries the real API: Signature (formals), Parameters, Source / Reference Implementation, Full Example (runnable), Returns, and Dependency Functions. Authority order: Source / Reference Implementation is highest (read the body for exact argument names/defaults, how each argument is consumed, returned object fields, and internal preconditions), then Signature and Full Example, then Parameters prose. Use exact argument names (no renaming, adding, or dropping), exact object flow between functions, and exact argument types (a hazard may be a rate vector + cut points, not a function). Replicate provided example calls rather than constructing calls from prose. If Signature and Source are both NOT PROVIDED for a function, precede your best-guess call with a prominent `# WARNING: UNVERIFIED CALL` comment naming the function and telling the user to run `formals(pkg::fn)`, `print(pkg::fn)`, and `?pkg::fn` and paste the results back. Follow ALL rules in Knowledge Base section 14.6.
+6. DEPENDENCY CHAINS (critical): treat each mapped custom-package function as an ENDPOINT that may require objects built by upstream functions of the same package (e.g. a display function requiring the object from a finalize/constructor function — watch for parameter descriptions like "an object generated by X()" or usage preconditions like "must set arg = value when calling X()"). Every function in that chain is required: generate the full chain constructor -> object -> endpoint, passing any required constructor arguments (like show.setting = "Y") ON the constructor call itself. If a dependency's signature is NOT documented in the FUNCTIONS SPECIFICATION, do not invent it silently — mark that specific call with `# WARNING: UNVERIFIED CALL`, name the undocumented function, state that the app cannot run end to end until its signature is supplied, and include the exact `formals(pkg::fn)` / `?pkg::fn` commands to fix it. Never present a guessed call as working code. Follow ALL rules in Knowledge Base section 14.7.
+7. BLACK-BOX OUTPUT (critical): a mapped function's Source is for understanding only — NEVER reimplement, split, or copy plot/loop/computation code out of its body into the app. Call each mapped function once as a black box and handle only its return value or side effects. The number of app outputs equals the number of mapped-function CALLS, not the number of plots/steps inside them. Match the output wrapper to the function's output mode: base-R side-effect drawing -> one renderPlot on one device (use par(mfrow) + on.exit() for multiple internal plots, never one panel each); returns a ggplot -> print() it in renderPlot; returns a list/patchwork -> render from that structure; unclear -> one output plus a comment that the mode is unverified. Follow ALL rules in Knowledge Base section 14.8.
+8. BOUNDARY CORRECTNESS (critical): because failures hide inside the black box of a called function, the app must be correct at the boundary. (a) If a mapped function's body calls an undocumented helper on its input object (e.g. f.extract(nphDesign)), replicate the documented constructor example EXACTLY — do not trim/reshape the constructor call to fields you think are used — and add a comment naming the helper as an unverified internal dependency. (b) When related vector arguments must share lengths (body indexes them together, or derives K = length(...)), parse any comma-separated text inputs to numeric and validate with shiny::validate()/need() that parsing succeeded and lengths match BEFORE calling. (c) A TRUNCATED source body counts as NOT PROVIDED for any function the app calls directly — apply UNVERIFIED CALL handling. Follow ALL rules in Knowledge Base section 14.9.
+9. Guard every render/reactive on the inputs it reads using `req()` so the app does not error before the user provides inputs.
+10. Output ONLY the complete R code file content. Do not include markdown code block syntax (like ```r or ```) in your output—output raw R code only. No introductory or concluding text, just valid R code.
 """
                         
                         raw_output = call_llm(
