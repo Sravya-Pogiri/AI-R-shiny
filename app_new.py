@@ -1308,7 +1308,9 @@ You MUST strictly follow the conventions, layouts, design patterns, and performa
 1. Always load the required packages at the top of the code (e.g., using `library()`).
 2. Use modern layout packages like `bslib` for styling where appropriate, or as specified in the knowledge base.
 3. Write clean, modular, and reactive code.
-4. Output ONLY the complete R code file content. Do not include markdown code block syntax (like ```r or ```) in your output—output raw R code only. No introductory or concluding text, just valid R code.
+4. VECTORIZATION (critical): any function passed to `integrate()`, `curve()`, `outer()`, `optimize()`, `uniroot()`, or used to compute hazard/survival/density curves MUST return a vector the same length as its input. Wrap constants in `rep(value, length(t))`, use `ifelse()`/`pmin()`/`pmax()` instead of `if`/`else` inside such functions, compute cumulative integrals per time point with `sapply(t_grid, function(tt) integrate(f, 0, tt)$value)`, and extract `$value` from `integrate()` results. Follow ALL rules in Knowledge Base sections 14.4 and 14.5.
+5. Guard every render/reactive on the inputs it reads using `req()` so the app does not error before the user provides inputs.
+6. Output ONLY the complete R code file content. Do not include markdown code block syntax (like ```r or ```) in your output—output raw R code only. No introductory or concluding text, just valid R code.
 """
                         
                         raw_output = call_llm(

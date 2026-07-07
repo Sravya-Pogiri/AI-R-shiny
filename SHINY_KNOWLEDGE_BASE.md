@@ -1475,6 +1475,95 @@ mod_server <- function(id) {
 }
 ```
 
+### 14.4 R Vectorization Pitfalls (integrate, curves, apply-family)
+
+**CRITICAL RULE: any function passed to `integrate()`, `curve()`, `outer()`, `optimize()`, `uniroot()`, or used to compute survival/hazard/density curves over a vector `t` MUST be vectorized — it must return a numeric vector of the SAME LENGTH as its input.** `integrate()` calls the function with a vector of quadrature points; if the function returns a scalar, R errors with `"evaluation of function gave a result of wrong length"`.
+
+```r
+# BAD: constant hazard that returns a scalar regardless of length(t)
+h0_func <- function(t) input$h0_rate
+integrate(h0_func, 0, 5)  # ERROR: evaluation of function gave a result of wrong length
+
+# GOOD: replicate the constant to match the input length
+h0_func <- function(t) rep(input$h0_rate, length(t))
+integrate(h0_func, 0, 5)  # works
+
+# BAD: if/else only inspects the first element of t — wrong values or warnings/errors
+h1_func <- function(t) {
+  if (t < input$t_switch) input$h1_rate1 else input$h1_rate2
+}
+
+# GOOD: ifelse() is vectorized element-wise
+h1_func <- function(t) ifelse(t < input$t_switch, input$h1_rate1, input$h1_rate2)
+
+# GOOD: arithmetic on t, pmin/pmax, and ifelse all preserve length
+weibull_hazard <- function(t) (shape / scale) * (t / scale)^(shape - 1)
+capped <- function(t) pmin(rate_max, base_rate * t)
+
+# If a function genuinely cannot be vectorized (e.g., it itself calls integrate),
+# wrap it before passing it on:
+S_func <- function(t) exp(-integrate(h0_func, 0, t)$value)   # scalar-only
+S_vec  <- Vectorize(S_func)                                   # safe for curve()/sapply()
+# or: S_vec <- function(t) sapply(t, S_func)
+```
+
+Rules to apply when generating any numerical/statistical R code:
+- A function body that returns a constant or otherwise ignores `t` must be wrapped in `rep(value, length(t))`.
+- Use vectorized constructs (`ifelse()`, arithmetic on `t`, `pmin()`/`pmax()`, logical indexing) instead of `if`/`else`, which only evaluates the condition on the first element.
+- Cumulative hazards from `integrate()` must be computed per time point (`sapply(t_grid, function(tt) integrate(h_func, 0, tt)$value)`) — never `integrate(h_func, 0, t_grid)` with a vector upper limit.
+- `integrate()` returns a list; extract the number with `$value` before using it in arithmetic or plotting.
+
+### 14.5 General R Correctness Pitfalls
+
+```r
+# BAD: 1:n breaks when n == 0 (produces c(1, 0) and iterates backwards)
+for (i in 1:nrow(df)) { ... }
+# GOOD:
+for (i in seq_len(nrow(df))) { ... }
+
+# BAD: single-column subsetting silently drops to a vector, breaking downstream code
+sub <- df[, cols_selected]        # a vector if length(cols_selected) == 1
+# GOOD:
+sub <- df[, cols_selected, drop = FALSE]
+
+# BAD: using inputs before they exist — renders run once before the user acts,
+# and file/select inputs are NULL at startup
+output$plot <- renderPlot({
+  data <- read.csv(input$file$datapath)  # crashes: input$file is NULL initially
+})
+# GOOD: guard every render/reactive on the inputs it needs
+output$plot <- renderPlot({
+  req(input$file)
+  data <- read.csv(input$file$datapath)
+})
+
+# BAD: assuming text input is numeric
+threshold <- input$threshold_text * 2   # error if it came from textInput()
+# GOOD: use numericInput()/sliderInput() for numbers; if text is unavoidable,
+# convert and validate:
+threshold <- as.numeric(input$threshold_text)
+validate(need(!is.na(threshold), "Please enter a numeric threshold"))
+
+# BAD: comparing floating point with ==
+if (total == 1.0) { ... }
+# GOOD:
+if (isTRUE(all.equal(total, 1.0))) { ... }
+
+# BAD: sample(x) surprise — when x is a single number n, it samples from 1:n
+sample(ids)       # if ids happens to have length 1, this is sample(1:ids)
+# GOOD:
+ids[sample.int(length(ids))]
+
+# BAD: apply() over a data frame coerces everything to a common type (often character)
+apply(df, 1, function(row) row$age + 1)
+# GOOD: use vectorized column operations or dplyr::rowwise()/mapply()
+
+# BAD: is.na() check after == on possibly-NA values
+if (df$status == "active") { ... }   # NA in status makes the condition NA -> error in if()
+# GOOD:
+if (isTRUE(df$status == "active")) { ... }   # or filter NAs out first
+```
+
 ---
 
 ## 15. Package Quick Reference
